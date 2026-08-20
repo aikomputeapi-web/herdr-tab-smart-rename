@@ -15,6 +15,8 @@ import {
   shouldCallModel,
   validateTabLabel,
   workspaceCandidate,
+  isGenericWorkspaceName,
+  titleCase,
   MAX_CONTEXT_CHARS,
   MODEL_RATE_MS,
   type NamingContext,
@@ -66,6 +68,39 @@ test("label, workspace, and process policy stays deterministic", () => {
   ] as const) {
     assert.equal(heuristicTitle({ focusedPane: { process: { command } } }), title);
   }
+});
+
+test("title casing preserves acronyms instead of corrupting them", () => {
+  // Known acronyms are upper-cased from any input casing.
+  assert.equal(titleCase("var explainer"), "VAR Explainer");
+  assert.equal(titleCase("api gateway"), "API Gateway");
+
+  // Acronyms the model already capitalised must survive untouched, otherwise
+  // repeated evaluation degrades a name ("YOLO" -> "Yolo") on every pass.
+  assert.equal(titleCase("Enable YOLO Mode"), "Enable YOLO Mode");
+  assert.equal(titleCase("Deploy AWS Stack"), "Deploy AWS Stack");
+  assert.equal(titleCase("Fix SQL Query"), "Fix SQL Query");
+
+  // Ordinary words are still normalised.
+  assert.equal(titleCase("fix socket reconnect"), "Fix Socket Reconnect");
+  assert.equal(titleCase("SHOUTING loudly"), "SHOUTING Loudly");
+  assert.equal(titleCase("my-project_name"), "My Project Name");
+});
+
+test("generic workspace folders are detected so task names can replace them", () => {
+  // Folders that say nothing about the project: every workspace under them
+  // collapses to the same label, so the task name must win instead.
+  for (const name of ["Coding", "coding", "  CODING  ", "Src", "Temp", "System32", ""]) {
+    assert.equal(isGenericWorkspaceName(name), true, `expected generic: ${name}`);
+  }
+
+  // Real project names must keep their identity.
+  for (const name of ["Any Auto Register", "Herdr", "Tradebot", "Paystub Generator"]) {
+    assert.equal(isGenericWorkspaceName(name), false, `expected specific: ${name}`);
+  }
+
+  // A git worktree is always a meaningful identity, even if the folder is generic.
+  assert.equal(isGenericWorkspaceName("Coding", true), false);
 });
 
 test("model context keeps weighted session evidence under the hard cap", () => {

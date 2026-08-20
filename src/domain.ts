@@ -172,11 +172,15 @@ export function titleCase(input: unknown): string {
     .replace(/[-_]+/g, " ")
     .split(/\s+/)
     .filter(Boolean)
-    .map((word) =>
-      acronyms.has(word.toLowerCase())
-        ? word.toUpperCase()
-        : word[0]!.toUpperCase() + word.slice(1).toLowerCase(),
-    )
+    .map((word) => {
+      if (acronyms.has(word.toLowerCase())) return word.toUpperCase();
+      // Preserve acronyms the caller already capitalised (YOLO, AWS, SQL).
+      // Re-casing them would corrupt a name on every evaluation pass.
+      if (word.length > 1 && word === word.toUpperCase() && /[A-Z]/.test(word)) {
+        return word;
+      }
+      return word[0]!.toUpperCase() + word.slice(1).toLowerCase();
+    })
     .join(" ");
 }
 
@@ -220,6 +224,48 @@ export function workspaceCandidate(
     path.basename(stablePane?.foreground_cwd || stablePane?.cwd || "") ||
     current;
   return titleCase(identity);
+}
+
+/**
+ * Directory names that identify a generic code dump rather than a project.
+ * When a workspace resolves to one of these there is no useful identity to
+ * show, so callers should fall back to naming it after the work being done.
+ */
+const GENERIC_WORKSPACE_NAMES = new Set([
+  "coding",
+  "code",
+  "src",
+  "source",
+  "dev",
+  "projects",
+  "repos",
+  "workspace",
+  "home",
+  "desktop",
+  "documents",
+  "temp",
+  "tmp",
+  "system32",
+  "administrator",
+  "users",
+]);
+
+/**
+ * True when a cwd-derived workspace name carries no distinguishing signal.
+ *
+ * Every workspace rooted at the same generic folder (the common case on this
+ * machine, where everything lives under `coding`) collapses to an identical
+ * label. Detecting that lets the service name the workspace after its task
+ * instead, which is the only way to tell those workspaces apart.
+ */
+export function isGenericWorkspaceName(
+  name: unknown,
+  hasWorktree = false,
+): boolean {
+  if (hasWorktree) return false;
+  const value = String(name ?? "").trim().toLowerCase();
+  if (!value) return true;
+  return GENERIC_WORKSPACE_NAMES.has(value);
 }
 
 export function heuristicTitle(context: {

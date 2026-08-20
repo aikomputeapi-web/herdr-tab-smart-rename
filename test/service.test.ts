@@ -236,6 +236,162 @@ test("explicit refresh reclaims manual tabs and bypasses model gates", async () 
   }
 });
 
+test("generic workspace folders take the task name while real projects keep theirs", async () => {
+  // Two workspaces rooted at the same generic folder must not both read "Coding".
+  const genericDir = await mkdtemp(path.join(os.tmpdir(), "tab-smart-rename-generic-"));
+  const genericPaths = statePaths(genericDir);
+  const genericSnap = liveSnapshot();
+  genericSnap.workspaces[0]!.label = "Coding";
+  genericSnap.panes[0]!.cwd = "/home/administrator/coding";
+
+  const genericService = new AutoNameService({
+    stateFile: genericPaths.state,
+    stateLock: genericPaths.stateLock,
+    namer: {
+      suggest: async () => ({ tab: "Fix Provider Issues", reason: "task" }),
+    },
+    dependencies: dependencies(() => genericSnap, {
+      gitRoot: async () => null,
+      focusedPaneContext: async (pane) =>
+        contextFor(pane, { userMessages: ["fix the provider issues"] }),
+      rename: async (kind, id, label) => {
+        if (kind === "workspace" && id === "w1") genericSnap.workspaces[0]!.label = label;
+        if (kind === "tab" && id === "t1") genericSnap.tabs[0]!.label = label;
+      },
+    }),
+  });
+
+  try {
+    await genericService.initialize(genericSnap);
+    const result = await genericService.evaluate("t1", {
+      resetKind: "workspace",
+      forceRefresh: true,
+    });
+    assert.ok(result);
+    // The workspace adopts the task name instead of the useless folder name.
+    assert.equal(result.candidate.workspace, "Fix Provider Issues");
+    assert.equal(genericSnap.workspaces[0]!.label, "Fix Provider Issues");
+  } finally {
+    await rm(genericDir, { recursive: true, force: true });
+  }
+
+  // A workspace with a real project folder must keep that identity.
+  const projectDir = await mkdtemp(path.join(os.tmpdir(), "tab-smart-rename-project-"));
+  const projectPaths = statePaths(projectDir);
+  const projectSnap = liveSnapshot();
+  projectSnap.workspaces[0]!.label = "1";
+  projectSnap.panes[0]!.cwd = "/home/administrator/coding/tradebot";
+
+  const projectService = new AutoNameService({
+    stateFile: projectPaths.state,
+    stateLock: projectPaths.stateLock,
+    namer: {
+      suggest: async () => ({ tab: "Fix Provider Issues", reason: "task" }),
+    },
+    dependencies: dependencies(() => projectSnap, {
+      gitRoot: async () => "/home/administrator/coding/tradebot",
+      focusedPaneContext: async (pane) =>
+        contextFor(pane, { userMessages: ["fix the provider issues"] }),
+      rename: async (kind, id, label) => {
+        if (kind === "workspace" && id === "w1") projectSnap.workspaces[0]!.label = label;
+        if (kind === "tab" && id === "t1") projectSnap.tabs[0]!.label = label;
+      },
+    }),
+  });
+
+  try {
+    await projectService.initialize(projectSnap);
+    const result = await projectService.evaluate("t1", {
+      resetKind: "workspace",
+      forceRefresh: true,
+    });
+    assert.ok(result);
+    assert.equal(result.candidate.workspace, "Tradebot");
+    assert.equal(result.candidate.tab, "Fix Provider Issues");
+  } finally {
+    await rm(projectDir, { recursive: true, force: true });
+  }
+});
+
+test("only the active tab names a generic workspace, and its name is stable", async () => {
+  // Regression: with two tabs open, each evaluation used to rewrite the
+  // workspace label, so the sidebar flickered between unrelated task names.
+  // Re-deriving also pushed the existing label back through titleCase,
+  // corrupting acronyms ("Enable YOLO Mode" -> "Enable Yolo Mode").
+  const dir = await mkdtemp(path.join(os.tmpdir(), "tab-smart-rename-active-"));
+  const paths = statePaths(dir);
+  const snap = liveSnapshot();
+  snap.workspaces[0]!.label = "Coding";
+  snap.workspaces[0]!.active_tab_id = "t1";
+  snap.panes[0]!.cwd = "/home/administrator/coding";
+  snap.tabs.push({ tab_id: "t2", workspace_id: "w1", label: "2", number: 2 });
+  snap.panes.push({
+    pane_id: "p2",
+    tab_id: "t2",
+    workspace_id: "w1",
+    cwd: "/home/administrator/coding",
+    agent: "pi",
+  });
+  snap.layouts.push({ tab_id: "t2", focused_pane_id: "p2" });
+
+  const names: Record<string, string> = {
+    p1: "Enable YOLO Mode",
+    p2: "Update Agent Manager",
+  };
+  let pending = "Enable YOLO Mode";
+
+  const service = new AutoNameService({
+    stateFile: paths.state,
+    stateLock: paths.stateLock,
+    namer: { suggest: async () => ({ tab: pending, reason: "task" }) },
+    dependencies: dependencies(() => snap, {
+      gitRoot: async () => null,
+      focusedPaneContext: async (pane) => {
+        pending = names[pane.pane_id] ?? "Fallback Task Name";
+        return contextFor(pane, { userMessages: [`work on ${pane.pane_id}`] });
+      },
+      rename: async (kind, id, label) => {
+        if (kind === "workspace") snap.workspaces[0]!.label = label;
+        if (kind === "tab") {
+          const target = snap.tabs.find((item) => item.tab_id === id);
+          if (target) target.label = label;
+        }
+      },
+    }),
+  });
+
+  try {
+    await service.initialize(snap);
+
+    // Active tab t1 names the workspace.
+    const first = await service.evaluate("t1", {
+      resetKind: "workspace",
+      forceRefresh: true,
+    });
+    assert.ok(first);
+    assert.equal(snap.workspaces[0]!.label, "Enable YOLO Mode");
+
+    // Non-active tab t2 names only itself and must not touch the workspace.
+    const second = await service.evaluate("t2", { forceRefresh: true });
+    assert.ok(second);
+    assert.equal(second.candidate.tab, "Update Agent Manager");
+    assert.equal(
+      snap.workspaces[0]!.label,
+      "Enable YOLO Mode",
+      "non-active tab must not rename the workspace",
+    );
+    assert.equal(
+      second.changes.some((change) => change.kind === "workspace"),
+      false,
+    );
+
+    // The acronym must survive repeated evaluation.
+    assert.equal(snap.workspaces[0]!.label, "Enable YOLO Mode");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("concurrent evaluations keep expected writes durable and avoid stale races", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "tab-smart-rename-race-"));
   const paths = statePaths(dir);

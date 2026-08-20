@@ -3,6 +3,7 @@ import {
   buildModelContext,
   heuristicTitle,
   isDefaultLabel,
+  isGenericWorkspaceName,
   markModelAttempt,
   markModelSuccess,
   observeStableContext,
@@ -199,7 +200,11 @@ export class AutoNameService {
   private async workspaceDetails(
     workspace: HerdrWorkspace,
     snap: HerdrSnapshot,
-  ): Promise<{ stablePane: HerdrPane | undefined; workspaceName: string }> {
+  ): Promise<{
+    stablePane: HerdrPane | undefined;
+    workspaceName: string;
+    workspaceIsGeneric: boolean;
+  }> {
     const stablePane = snap.panes.find(
       (pane) => pane.workspace_id === workspace.workspace_id,
     );
@@ -211,9 +216,14 @@ export class AutoNameService {
           stablePane?.foreground_cwd ?? stablePane?.cwd,
         )
       : null;
+    const workspaceName = workspaceCandidate(workspace, stablePane, root);
     return {
       stablePane,
-      workspaceName: workspaceCandidate(workspace, stablePane, root),
+      workspaceName,
+      workspaceIsGeneric: isGenericWorkspaceName(
+        workspaceName,
+        Boolean(workspace.worktree?.repo_name),
+      ),
     };
   }
 
@@ -299,7 +309,10 @@ export class AutoNameService {
       };
     }
 
-    const { workspaceName } = await this.workspaceDetails(workspace, snap);
+    const { workspaceName, workspaceIsGeneric } = await this.workspaceDetails(
+      workspace,
+      snap,
+    );
     let tabName: string | null = null;
     let reason = tabManual ? "manual tab ownership" : "";
     let usedModel = false;
@@ -361,12 +374,43 @@ export class AutoNameService {
     }
 
     const changes: RenameChange[] = [];
-    if (!workspaceManual && workspaceName && workspace.label !== workspaceName) {
+
+    // A workspace whose name comes from a generic folder (e.g. everything under
+    // `coding`) is indistinguishable from its siblings. In that case prefer the
+    // task-derived tab name, which is the only label that actually says what the
+    // workspace is for. Real projects and git worktrees keep their identity.
+    //
+    // Only the workspace's active tab may set the name. Without this, every tab
+    // in a multi-tab workspace overwrites the label in turn and the sidebar
+    // flickers between unrelated task names.
+    const activeTabId = workspace.active_tab_id ?? tab.tab_id;
+    const tabOwnsWorkspaceName = activeTabId === tab.tab_id;
+
+    // A workspace we already auto-named stays under our control even though its
+    // new label no longer looks generic. Without this the label gets re-derived
+    // and pushed back through titleCase, corrupting acronyms on every pass
+    // ("Enable YOLO Mode" -> "Enable Yolo Mode").
+    const previousAuto = workspaceRecord?.autoLabel;
+    const workspaceAutoNamed = Boolean(
+      previousAuto && workspace.label === previousAuto,
+    );
+
+    let effectiveWorkspaceName = workspaceName;
+    if (workspaceIsGeneric || workspaceAutoNamed) {
+      effectiveWorkspaceName =
+        (tabOwnsWorkspaceName ? tabName : null) ?? previousAuto ?? workspaceName;
+    }
+
+    if (
+      !workspaceManual &&
+      effectiveWorkspaceName &&
+      workspace.label !== effectiveWorkspaceName
+    ) {
       changes.push({
         kind: "workspace",
         id: workspace.workspace_id,
         from: workspace.label,
-        to: workspaceName,
+        to: effectiveWorkspaceName,
       });
     }
     if (!tabManual && tabName && tab.label !== tabName) {
@@ -405,7 +449,7 @@ export class AutoNameService {
       dryRun: this.#dryRun,
       workspace: workspace.workspace_id,
       tab: tab.tab_id,
-      candidate: { workspace: workspaceName, tab: tabName },
+      candidate: { workspace: effectiveWorkspaceName, tab: tabName },
       reason,
       usedModel,
       ownership: { workspaceManual, tabManual },
