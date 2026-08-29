@@ -243,6 +243,7 @@ test("generic workspace folders take the task name while real projects keep thei
   const genericSnap = liveSnapshot();
   genericSnap.workspaces[0]!.label = "Coding";
   genericSnap.panes[0]!.cwd = "/home/administrator/coding";
+  genericSnap.panes[0]!.agent = undefined;
 
   const genericService = new AutoNameService({
     stateFile: genericPaths.state,
@@ -313,6 +314,46 @@ test("generic workspace folders take the task name while real projects keep thei
   }
 });
 
+test("generic workspace takes the agent's name over the task name", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "tab-smart-rename-agent-"));
+  const paths = statePaths(dir);
+  const snap = liveSnapshot();
+  snap.workspaces[0]!.label = "Coding";
+  snap.panes[0]!.cwd = "/home/administrator/coding";
+  snap.panes[0]!.agent = "claude";
+
+  const service = new AutoNameService({
+    stateFile: paths.state,
+    stateLock: paths.stateLock,
+    namer: {
+      suggest: async () => ({ tab: "Fix Provider Issues", reason: "task" }),
+    },
+    dependencies: dependencies(() => snap, {
+      gitRoot: async () => null,
+      focusedPaneContext: async (pane) =>
+        contextFor(pane, { userMessages: ["fix the provider issues"] }),
+      rename: async (kind, id, label) => {
+        if (kind === "workspace" && id === "w1") snap.workspaces[0]!.label = label;
+        if (kind === "tab" && id === "t1") snap.tabs[0]!.label = label;
+      },
+    }),
+  });
+
+  try {
+    await service.initialize(snap);
+    const result = await service.evaluate("t1", {
+      resetKind: "workspace",
+      forceRefresh: true,
+    });
+    assert.ok(result);
+    // The workspace takes the agent's name; the task name still goes on the tab.
+    assert.equal(result.candidate.workspace, "Claude");
+    assert.equal(result.candidate.tab, "Fix Provider Issues");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("only the active tab names a generic workspace, and its name is stable", async () => {
   // Regression: with two tabs open, each evaluation used to rewrite the
   // workspace label, so the sidebar flickered between unrelated task names.
@@ -324,13 +365,13 @@ test("only the active tab names a generic workspace, and its name is stable", as
   snap.workspaces[0]!.label = "Coding";
   snap.workspaces[0]!.active_tab_id = "t1";
   snap.panes[0]!.cwd = "/home/administrator/coding";
+  snap.panes[0]!.agent = undefined;
   snap.tabs.push({ tab_id: "t2", workspace_id: "w1", label: "2", number: 2 });
   snap.panes.push({
     pane_id: "p2",
     tab_id: "t2",
     workspace_id: "w1",
     cwd: "/home/administrator/coding",
-    agent: "pi",
   });
   snap.layouts.push({ tab_id: "t2", focused_pane_id: "p2" });
 

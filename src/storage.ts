@@ -30,6 +30,11 @@ const StateSchema: z.ZodType<SmartRenameState> = z.looseObject({
   modelAttempts: z.record(z.string(), z.number()),
   fingerprints: z.record(z.string(), z.string()),
   pendingFingerprints: z.record(z.string(), z.string()),
+  // Added after the first release, so a state file written by an older build
+  // has neither. Optional keeps those files loadable instead of resetting a
+  // user's ownership records over a missing counter.
+  contextChanges: z.record(z.string(), z.number()).optional(),
+  namedAt: z.record(z.string(), z.number()).optional(),
 });
 
 const UnknownRecordSchema = z.record(z.string(), z.unknown());
@@ -143,16 +148,27 @@ export function pidAlive(
 }
 
 async function commandForPid(pid: number): Promise<string> {
-  const process = Bun.spawn(["ps", "-p", String(pid), "-o", "command="], {
+  const command =
+    process.platform === "win32"
+      ? [
+          "powershell.exe",
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`,
+        ]
+      : ["ps", "-p", String(pid), "-o", "command="];
+  const proc = Bun.spawn(command, {
     stdout: "pipe",
     stderr: "ignore",
+    windowsHide: true,
   });
-  const [command, exitCode] = await Promise.all([
-    new Response(process.stdout).text(),
-    process.exited,
+  const [output, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    proc.exited,
   ]);
-  if (exitCode !== 0) throw new Error(`ps exited ${exitCode}`);
-  return command.trim();
+  if (exitCode !== 0) throw new Error(`${command[0]} exited ${exitCode}`);
+  return output.trim();
 }
 
 interface WorkerDependencies {

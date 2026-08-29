@@ -48,7 +48,20 @@ export async function runWorker(
     await chmod(paths.log, 0o600).catch(() => {});
   };
 
-  await service.initialize();
+  // Herdr's server can be absent at logon, or left on an older wire protocol by a
+  // stale launcher shortcut. Both make the first snapshot throw. Exiting here left
+  // the worker dead until the next logon, so retry until herdr is reachable.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await service.initialize();
+      if (attempt > 0) await log(`initialized after ${attempt} retries`);
+      break;
+    } catch (error) {
+      const delay = Math.min(60_000, 2_000 * 2 ** Math.min(attempt, 5));
+      await log(`initialize failed (retry in ${delay}ms): ${errorMessage(error)}`);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
 
   let socket: Socket | null = null;
   let stopped = false;

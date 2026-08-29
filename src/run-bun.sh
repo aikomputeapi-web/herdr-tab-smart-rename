@@ -10,6 +10,12 @@ if [ -n "${HOME:-}" ] && [ -x "$HOME/.bun/bin/bun" ]; then
   exec "$HOME/.bun/bin/bun" "$@"
 fi
 
+for cand in "$USERPROFILE/.bun/bin/bun.exe" "/c/Users/Administrator/.bun/bin/bun.exe" "C:/Users/Administrator/.bun/bin/bun.exe"; do
+  if [ -n "${cand:-}" ] && [ -x "$cand" ]; then
+    exec "$cand" "$@"
+  fi
+done
+
 for bun_path in /opt/homebrew/bin/bun /usr/local/bin/bun /home/linuxbrew/.linuxbrew/bin/bun; do
   if [ -x "$bun_path" ]; then
     exec "$bun_path" "$@"
