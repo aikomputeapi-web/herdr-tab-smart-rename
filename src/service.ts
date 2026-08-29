@@ -1,10 +1,13 @@
 import {
   acknowledgeRename,
+  agentDisplayName,
+  agentTitleLabel,
   buildModelContext,
   heuristicTitle,
   isDefaultLabel,
   isGenericWorkspaceName,
   markModelAttempt,
+  markNamed,
   markModelSuccess,
   observeStableContext,
   prepareRename,
@@ -21,6 +24,7 @@ import {
   focusedPaneContext,
   gitRoot,
   rename,
+  reportWorkspaceTask,
   siblingPaneContext,
   snapshot,
   type HerdrPane,
@@ -52,6 +56,11 @@ export interface ServiceDependencies {
     label: string,
     env?: NodeJS.ProcessEnv,
   ): Promise<void>;
+  reportWorkspaceTask(
+    workspaceId: string,
+    task: string | null,
+    env?: NodeJS.ProcessEnv,
+  ): Promise<void>;
 }
 
 export interface EvaluateOptions {
@@ -81,6 +90,7 @@ const defaultDependencies: ServiceDependencies = {
   focusedPaneContext,
   siblingPaneContext,
   rename,
+  reportWorkspaceTask,
 };
 
 export function focusedPaneFor(
@@ -107,10 +117,18 @@ export function reconcileSnapshot(
   snap: HerdrSnapshot,
 ): SmartRenameState {
   for (const workspace of snap.workspaces) {
+    // A workspace's initial label is often a generic cwd basename (e.g.
+    // "coding") rather than blank or numeric. Without also treating generic
+    // names as eligible, that label reads as an intentional user rename the
+    // very first time we see it, and the workspace gets locked out of
+    // auto-naming forever.
+    const eligible =
+      isDefaultLabel(workspace.label, workspace.number) ||
+      isGenericWorkspaceName(workspace.label, Boolean(workspace.worktree?.repo_name));
     state.workspaces[workspace.workspace_id] = reconcileItem(
       state.workspaces[workspace.workspace_id],
       workspace.label,
-      isDefaultLabel(workspace.label, workspace.number),
+      eligible,
     );
   }
   for (const tab of snap.tabs) {
@@ -338,6 +356,10 @@ export class AutoNameService {
           reason = "waiting for stable command context";
         } else {
           const gate = shouldCallModel(state, tab.tab_id, details.context);
+          // The agent's own session title costs nothing and is only consulted
+          // when the namer produces no label, so it never overrides a real
+          // suggestion.
+          const fallbackTitle = agentTitleLabel(focusedContext?.sessionTitle);
           if (gate.allowed || options.forceModel || options.forceRefresh) {
             markModelAttempt(state, tab.tab_id);
             if (!this.#dryRun) await persist();
@@ -345,12 +367,29 @@ export class AutoNameService {
             try {
               const suggestion = await this.#namer.suggest(details.context);
               markModelSuccess(state, tab.tab_id, details.context);
-              tabName = suggestion.tab;
-              reason = suggestion.reason;
+              tabName = suggestion.tab ?? fallbackTitle;
+              reason =
+                suggestion.tab || !fallbackTitle
+                  ? suggestion.reason
+                  : `${suggestion.reason}; used agent session title`;
+              usedModel = true;
+            } catch (error) {
+              if (!fallbackTitle) throw error;
+              // An exhausted free tier or a provider outage should not leave the
+              // tab on "1" when the agent has already titled the session itself.
+              // Record the fingerprint anyway so a persistent outage costs one
+              // request per context change rather than one per sweep; the next
+              // message the user sends moves it and earns a fresh attempt.
+              markModelSuccess(state, tab.tab_id, details.context);
+              tabName = fallbackTitle;
+              reason = `agent session title (${errorMessage(error)})`;
               usedModel = true;
             } finally {
               await stopActivity?.();
             }
+            // Starts the backoff only once the tab actually carries a label, so
+            // a tab the namer declined keeps trying on the next message.
+            if (tabName) markNamed(state, tab.tab_id);
           } else {
             reason = "unchanged or rate-limited context";
           }
@@ -377,14 +416,17 @@ export class AutoNameService {
 
     // A workspace whose name comes from a generic folder (e.g. everything under
     // `coding`) is indistinguishable from its siblings. In that case prefer the
-    // task-derived tab name, which is the only label that actually says what the
-    // workspace is for. Real projects and git worktrees keep their identity.
+    // name of the agent CLI running in it (Claude, Codex, OpenCode, ...) since
+    // that is a stable per-workspace identity; fall back to the task-derived
+    // tab name for plain shells with no agent. Real projects and git
+    // worktrees keep their identity.
     //
     // Only the workspace's active tab may set the name. Without this, every tab
     // in a multi-tab workspace overwrites the label in turn and the sidebar
     // flickers between unrelated task names.
     const activeTabId = workspace.active_tab_id ?? tab.tab_id;
     const tabOwnsWorkspaceName = activeTabId === tab.tab_id;
+    const workspaceAgentName = agentDisplayName(focusedPaneFor(tab, snap)?.agent);
 
     // A workspace we already auto-named stays under our control even though its
     // new label no longer looks generic. Without this the label gets re-derived
@@ -398,7 +440,9 @@ export class AutoNameService {
     let effectiveWorkspaceName = workspaceName;
     if (workspaceIsGeneric || workspaceAutoNamed) {
       effectiveWorkspaceName =
-        (tabOwnsWorkspaceName ? tabName : null) ?? previousAuto ?? workspaceName;
+        (tabOwnsWorkspaceName ? workspaceAgentName ?? tabName : null) ??
+        previousAuto ??
+        workspaceName;
     }
 
     if (
@@ -445,6 +489,19 @@ export class AutoNameService {
       }
     }
 
+    // Herdr's Spaces rows have no tab element, so the task line has to arrive
+    // as workspace metadata. Publishing only on a mismatch keeps this free on
+    // idle sweeps and still repairs itself after a restart clears the tokens.
+    if (!this.#dryRun && tabOwnsWorkspaceName) {
+      const task = tabName ?? tab.label;
+      if (workspace.tokens?.["task"] !== task) {
+        await this.#dependencies
+          .reportWorkspaceTask(workspace.workspace_id, task, this.#env)
+          // A sidebar decoration must never block a rename.
+          .catch(() => {});
+      }
+    }
+
     return {
       dryRun: this.#dryRun,
       workspace: workspace.workspace_id,
@@ -485,4 +542,8 @@ export function createService({
     ...(modelActivity ? { modelActivity } : {}),
     dependencies,
   });
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

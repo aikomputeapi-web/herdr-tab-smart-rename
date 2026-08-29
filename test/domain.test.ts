@@ -8,11 +8,13 @@ import {
   isDefaultLabel,
   markModelAttempt,
   markModelSuccess,
+  markNamed,
   observeStableContext,
   prepareRename,
   reconcileItem,
   resetOwnership,
   shouldCallModel,
+  shouldRenameAtChange,
   validateTabLabel,
   workspaceCandidate,
   isGenericWorkspaceName,
@@ -146,7 +148,7 @@ test("text sanitization delegates ANSI and secret removal to libraries", () => {
   assert.match(output, /redacted/i);
 });
 
-test("stable fingerprints and model cooldown suppress churn", () => {
+test("a transcript spends a request only when the user says something new", () => {
   const state = emptyState();
   const context: NamingContext = {
     project: "Agents",
@@ -155,15 +157,82 @@ test("stable fingerprints and model cooldown suppress churn", () => {
   assert.equal(observeStableContext(state, "t1", context), false);
   assert.equal(observeStableContext(state, "t1", context), true);
   assert.equal(shouldCallModel(state, "t1", context, 1_000_000).allowed, true);
+
+  // The cooldown exists to damp terminal redraw noise. A transcript changes
+  // only when the user types, so waiting it out would leave a fresh request
+  // unnamed for ten minutes and save nothing.
   markModelAttempt(state, "t1", 1_000_000);
-  assert.equal(shouldCallModel(state, "t1", context, 1_000_001).allowed, false);
-  assert.equal(
-    shouldCallModel(state, "t1", context, 1_000_000 + MODEL_RATE_MS + 1).allowed,
-    true,
-  );
+  assert.equal(shouldCallModel(state, "t1", context, 1_000_001).allowed, true);
+
   markModelSuccess(state, "t1", context);
   assert.equal(
     shouldCallModel(state, "t1", context, 1_000_000 + MODEL_RATE_MS * 2).allowed,
+    false,
+  );
+
+  const next: NamingContext = {
+    project: "Agents",
+    userRequests: ["inspect logs", "now ship it"],
+  };
+  assert.equal(shouldCallModel(state, "t1", next, 1_000_002).allowed, true);
+});
+
+test("a named tab re-checks on a widening interval, not every message", () => {
+  const state = emptyState();
+  const context = (n: number): NamingContext => ({
+    project: "Agents",
+    userRequests: [`message ${n}`],
+  });
+
+  // The first message has to spend a request: the tab has no label yet.
+  assert.equal(shouldCallModel(state, "t1", context(1), 0).allowed, true);
+  markModelSuccess(state, "t1", context(1));
+  markNamed(state, "t1");
+
+  const spent: number[] = [];
+  for (let message = 2; message <= 32; message++) {
+    const gate = shouldCallModel(state, "t1", context(message), message);
+    if (!gate.allowed) continue;
+    spent.push(message);
+    markModelSuccess(state, "t1", context(message));
+    markNamed(state, "t1");
+  }
+
+  // Thirty-one further messages cost four requests instead of thirty-one.
+  assert.deepEqual(spent, [3, 7, 15, 31]);
+});
+
+test("backoff thresholds land on 1, 3, 7, 15, 31", () => {
+  const hit = Array.from({ length: 32 }, (_, index) => index + 1).filter(
+    shouldRenameAtChange,
+  );
+  assert.deepEqual(hit, [1, 3, 7, 15, 31]);
+});
+
+test("terminal context stays behind the model cooldown", () => {
+  const state = emptyState();
+  const context: NamingContext = {
+    project: "Agents",
+    focusedPane: { process: null, recentOutput: "working 1s" },
+  };
+  assert.equal(shouldCallModel(state, "t2", context, 1_000_000).allowed, true);
+  markModelAttempt(state, "t2", 1_000_000);
+
+  // A spinner rewrites itself every second, so without the cooldown this
+  // context would look new on every sweep and spend a request each time.
+  const redrawn: NamingContext = {
+    project: "Agents",
+    focusedPane: { process: null, recentOutput: "working 2s" },
+  };
+  assert.equal(shouldCallModel(state, "t2", redrawn, 1_000_001).allowed, false);
+  assert.equal(
+    shouldCallModel(state, "t2", redrawn, 1_000_000 + MODEL_RATE_MS + 1).allowed,
+    true,
+  );
+
+  markModelSuccess(state, "t2", context);
+  assert.equal(
+    shouldCallModel(state, "t2", context, 1_000_000 + MODEL_RATE_MS * 2).allowed,
     false,
   );
 });

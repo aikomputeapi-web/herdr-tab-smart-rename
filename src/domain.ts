@@ -16,6 +16,10 @@ export interface SmartRenameState {
   modelAttempts: Record<string, number>;
   fingerprints: Record<string, string>;
   pendingFingerprints: Record<string, string>;
+  /** Distinct contexts seen per tab; the backoff counts these, not sweeps. */
+  contextChanges?: Record<string, number> | undefined;
+  /** Value of contextChanges when the tab last earned a label. */
+  namedAt?: Record<string, number> | undefined;
   [key: string]: unknown;
 }
 
@@ -38,6 +42,8 @@ export interface PaneContext {
   recentOutput: string;
   userMessages: string[];
   sessionMessages?: SessionTimeline;
+  /** Title the agent already computed for its own session, if it exposes one. */
+  sessionTitle?: string | null;
 }
 
 interface ProcessEvidence {
@@ -268,6 +274,29 @@ export function isGenericWorkspaceName(
   return GENERIC_WORKSPACE_NAMES.has(value);
 }
 
+/**
+ * Known agent CLI slugs (Herdr's `pane.agent` value) mapped to their display
+ * name. Falls back to title-casing the slug so a CLI added later still gets
+ * a readable name instead of being silently dropped.
+ */
+const AGENT_DISPLAY_NAMES: Record<string, string> = {
+  claude: "Claude",
+  codex: "Codex",
+  opencode: "OpenCode",
+  pi: "Pi",
+  gemini: "Gemini",
+  aider: "Aider",
+  cursor: "Cursor",
+  jcode: "JCode",
+  muse: "Muse Code",
+};
+
+export function agentDisplayName(agent: unknown): string | null {
+  const value = String(agent ?? "").trim().toLowerCase();
+  if (!value) return null;
+  return AGENT_DISPLAY_NAMES[value] ?? titleCase(value);
+}
+
 export function heuristicTitle(context: {
   focusedPane?: {
     process?: Partial<ProcessInfo> | null;
@@ -383,6 +412,28 @@ export function observeStableContext(
   return false;
 }
 
+/**
+ * True when the context describes what the user asked for rather than what the
+ * terminal happens to be drawing. Transcript context is stable between sweeps;
+ * pane output is not, since a spinner or token counter rewrites itself every
+ * second.
+ */
+export function isTranscriptContext(context: NamingContext): boolean {
+  return "sessionTimeline" in context || "userRequests" in context;
+}
+
+/**
+ * Naming again on every message is nearly all waste: the topic is settled after
+ * the first few, and calls after that re-derive the label the tab already has.
+ * Re-check on a widening interval instead — messages 1, 3, 7, 15, 31 — which
+ * costs about five requests over a fifty-message session while still noticing a
+ * genuine change of subject within a few messages of it happening.
+ */
+export function shouldRenameAtChange(changes: number): boolean {
+  const next = changes + 1;
+  return next > 0 && (next & (next - 1)) === 0;
+}
+
 export function shouldCallModel(
   state: SmartRenameState,
   tabId: string,
@@ -390,12 +441,65 @@ export function shouldCallModel(
   now = Date.now(),
 ): { allowed: boolean; fingerprint: string } {
   const mark = fingerprint(context);
+  // Nothing the namer would see has changed, so any call would re-derive the
+  // label it already produced. This is the check that keeps idle tabs free.
+  if (state.fingerprints[tabId] === mark) {
+    return { allowed: false, fingerprint: mark };
+  }
+
+  // Terminal-derived context has no message to count: its fingerprint changes
+  // on every redraw, so the clock is the only thing standing between it and a
+  // request per sweep.
+  if (!isTranscriptContext(context)) {
+    return {
+      allowed: now - (state.modelAttempts[tabId] ?? 0) >= MODEL_RATE_MS,
+      fingerprint: mark,
+    };
+  }
+
+  // A transcript fingerprint moves once per user message, so counting the moves
+  // counts the conversation. The cooldown does not apply here — it exists to
+  // damp redraw noise, and waiting it out would only delay a real rename.
+  const changes = (state.contextChanges?.[tabId] ?? 0) + 1;
+  state.contextChanges = { ...state.contextChanges, [tabId]: changes };
+  const named = state.namedAt?.[tabId];
   return {
-    allowed:
-      state.fingerprints[tabId] !== mark &&
-      now - (state.modelAttempts[tabId] ?? 0) >= MODEL_RATE_MS,
+    allowed: named === undefined || shouldRenameAtChange(changes),
     fingerprint: mark,
   };
+}
+
+/**
+ * Records that a tab is now carrying a model-derived label, which starts the
+ * backoff. Only called when a label was actually produced, so a tab the namer
+ * declined keeps trying on the next message instead of going quiet.
+ */
+export function markNamed(state: SmartRenameState, tabId: string): void {
+  state.namedAt = {
+    ...state.namedAt,
+    [tabId]: state.contextChanges?.[tabId] ?? 0,
+  };
+}
+
+/**
+ * Condenses an agent's own session title into something `validateTabLabel`
+ * accepts, so a tab still gets a real name when the namer is unavailable — a
+ * rate-limited free tier, most often. Returns null when nothing usable
+ * survives rather than forcing a bad label.
+ */
+export function agentTitleLabel(title: unknown): string | null {
+  const connectors = new Set([
+    "a", "an", "and", "for", "in", "of", "on", "the", "to", "with",
+  ]);
+  const words = titleCase(sanitizeText(title))
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 4);
+  while (words.length && connectors.has(words[words.length - 1]!.toLowerCase())) {
+    words.pop();
+  }
+  const label = words.join(" ");
+  return validateTabLabel(label) ? label : null;
 }
 
 export function markModelAttempt(

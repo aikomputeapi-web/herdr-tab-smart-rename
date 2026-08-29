@@ -1,7 +1,7 @@
 import net, { type Socket } from "node:net";
 import { z } from "zod";
 import { type PaneContext } from "./domain.ts";
-import { sampledUserMessages } from "./pi-context.ts";
+import { sessionDigest } from "./sessions.ts";
 import { boundedText } from "./text.ts";
 
 const WorkspaceSchema = z.looseObject({
@@ -11,6 +11,8 @@ const WorkspaceSchema = z.looseObject({
   active_tab_id: z.string().optional(),
   cwd: z.string().optional(),
   worktree: z.object({ repo_name: z.string().optional() }).nullable().optional(),
+  /** Display-only values published by plugins, rendered as `$name` in the sidebar. */
+  tokens: z.record(z.string(), z.string().nullable()).optional(),
 });
 
 const TabSchema = z.looseObject({
@@ -97,6 +99,7 @@ export type HerdrEvent = z.infer<typeof EventEnvelopeSchema>["data"] & {
 const TAB_PROGRESS_MARKER = "\u2063";
 const TAB_PROGRESS_FRAMES = ["◇", "◈", "◆", "◈"] as const;
 const TAB_PROGRESS_INTERVAL_MS = 120;
+export const WORKSPACE_METADATA_SOURCE = "tab-smart-rename";
 
 export function tabProgressBase(label: string): string | null {
   if (!label.startsWith(TAB_PROGRESS_MARKER)) return null;
@@ -140,6 +143,7 @@ export async function run(
     env: options.env ?? process.env,
     stdout: "pipe",
     stderr: "pipe",
+    windowsHide: true,
   });
   let timedOut = false;
   const timer = setTimeout(() => {
@@ -186,6 +190,32 @@ export async function rename(
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<void> {
   await run(env.HERDR_BIN_PATH || "herdr", [kind, "rename", id, label], { env });
+}
+
+/**
+ * Publishes the tab's name as a workspace token so the Spaces sidebar can show
+ * it beneath the space label. Herdr's spaces rows accept only `state_icon`,
+ * `state_text`, and `workspace` as built-in elements, so a task line has to
+ * arrive as plugin metadata; render it with a `$task` token in
+ * `[ui.sidebar.spaces]`.
+ */
+export async function reportWorkspaceTask(
+  workspaceId: string,
+  task: string | null,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+  await run(
+    env.HERDR_BIN_PATH || "herdr",
+    [
+      "workspace",
+      "report-metadata",
+      workspaceId,
+      "--source",
+      WORKSPACE_METADATA_SOURCE,
+      ...(task ? ["--token", `task=${task}`] : ["--clear-token", "task"]),
+    ],
+    { env },
+  );
 }
 
 export async function beginTabProgress(
@@ -299,21 +329,29 @@ export async function focusedPaneContext(
   pane: HerdrPane,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<PaneContext> {
-  const sessionPath =
-    pane.agent === "pi" && pane.agent_session?.kind === "path"
-      ? pane.agent_session.value
-      : null;
-  const [process, recentOutput, sessionMessages] = await Promise.all([
+  // Every agent CLI keeps a transcript somewhere; `sessionDigest` knows the
+  // shape per agent and returns an empty digest for ones it does not, so an
+  // unknown CLI falls back to terminal output instead of losing its name.
+  const [process, recentOutput, digest] = await Promise.all([
     paneProcess(pane.pane_id, env),
     paneRecent(pane.pane_id, env),
-    sampledUserMessages(sessionPath, env),
+    sessionDigest(
+      {
+        agent: pane.agent,
+        kind: pane.agent_session?.kind,
+        value: pane.agent_session?.value,
+      },
+      env,
+    ),
   ]);
+  const sessionMessages = digest.timeline;
   return {
     focused: true,
     label: boundedText(pane.label, 80),
     process,
     recentOutput,
     sessionMessages,
+    sessionTitle: digest.title,
     userMessages: [
       ...sessionMessages.origin,
       ...sessionMessages.middle,
@@ -346,11 +384,17 @@ export function normalizeHerdrEvent(message: unknown): HerdrEvent | null {
   };
 }
 
+function resolveSocketPath(socketPath: string): string {
+  if (process.platform !== "win32") return socketPath;
+  if (socketPath.startsWith("\\\\.\\pipe\\")) return socketPath;
+  return `\\\\.\\pipe\\${socketPath}`;
+}
+
 export function subscribe(
   socketPath: string,
   onEvent: (event: HerdrEvent) => void,
 ): Socket {
-  const socket = net.createConnection(socketPath);
+  const socket = net.createConnection(resolveSocketPath(socketPath));
   let buffer = "";
   socket.setEncoding("utf8");
   socket.on("connect", () => {
