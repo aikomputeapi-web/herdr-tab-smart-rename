@@ -26,17 +26,31 @@ Keep `reason` short. Never expose hidden reasoning or quote sensitive context. I
 
 A label must:
 
+- name the subject the work happens inside, then what is being done to it;
+- lead with the `project` value when context supplies one;
 - describe the task, not its actor or incidental tool;
-- use 2–4 words and at most 30 characters;
+- use 2–5 words and at most 34 characters;
 - use readable Title Case and preserve acronyms;
-- omit project, app, agent, model, and provider prefixes;
+- omit agent, model, and provider names;
 - prefer concrete verbs and nouns without invented specificity.
 
-Include a project or tool name only when it is the task object and omission would change the meaning.
+The project answers "inside what?" and is the most useful word in the label,
+because several tabs are usually doing similar work in different codebases.
+Use the `project` value as given, preserving its capitalisation, and put it
+first. When it is long or hyphen-derived (`Herdr Tab Smart Rename Win`), keep
+only the one or two words that identify it (`Herdr`). When context supplies no `project`, the subject is whatever the work
+acts on, and the label carries the task alone.
 
-Good: `Review Auth Changes`, `Repair Tab Ownership`, `Run Tests`, `View API Logs`.
+Drop the project only when it would crowd out the task past the word limit;
+the task is what makes two tabs in one project distinguishable, so trim the
+task's qualifiers before dropping the project entirely.
 
-Bad: `Kimi Auth Review`, `Pi Coding Agent`, a project name alone, a one-word label, or specificity unsupported by evidence.
+Good: `FISHGAME Fix Balance`, `Herdr Repair Tab Ownership`, `Snip Add Redirects`,
+`Review Auth Changes` (no project in context), `Run Tests`.
+
+Bad: `Fix Balance NaN` when the context says the project is FISHGAME, `Claude
+Fix Balance` or `Codex Auth Review` (an agent is not a project), a project name
+alone, a one-word label, or specificity unsupported by evidence.
 
 ## Evidence order
 

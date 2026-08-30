@@ -57,10 +57,10 @@ interface SiblingEvidence {
 }
 
 export type NamingContext =
-  | { project: string; sessionTimeline: SessionTimeline }
-  | { project: string; userRequests: string[] }
+  | { project?: string | undefined; sessionTimeline: SessionTimeline }
+  | { project?: string | undefined; userRequests: string[] }
   | {
-      project: string;
+      project?: string | undefined;
       focusedPane: ProcessEvidence;
       siblingPanes?: SiblingEvidence[];
     };
@@ -88,7 +88,7 @@ export interface RenameResult {
   changes: RenameChange[];
 }
 
-export const MAX_TAB_LENGTH = 30;
+export const MAX_TAB_LENGTH = 34;
 export const MAX_CONTEXT_CHARS = 4_500;
 export const MODEL_RATE_MS = 10 * 60 * 1_000;
 
@@ -195,7 +195,7 @@ export function validateTabLabel(label: unknown): label is string {
   const value = sanitizeText(label);
   if (!value || value.length > MAX_TAB_LENGTH) return false;
   const words = value.split(/\s+/);
-  if (words.length < 2 || words.length > 4) return false;
+  if (words.length < 2 || words.length > 5) return false;
   const connectors = new Set(["a", "an", "and", "for", "in", "of", "on", "to", "with"]);
   return words.every(
     (word, index) =>
@@ -230,6 +230,30 @@ export function workspaceCandidate(
     path.basename(stablePane?.foreground_cwd || stablePane?.cwd || "") ||
     current;
   return titleCase(identity);
+}
+
+/**
+ * The project a pane is working in, from the checkout rather than the label.
+ * `workspaceCandidate` prefers a meaningful existing label, so once a
+ * workspace has been auto-named after its agent ("Claude") that label would
+ * shadow the real project forever. Naming a tab after its project needs the
+ * checkout, so resolve it independently and return null for a generic
+ * container like `coding`, which identifies nothing.
+ */
+export function projectIdentity(
+  workspace: WorkspaceIdentity,
+  stablePane?: StablePane,
+  gitRoot?: string | null,
+): string | null {
+  const source =
+    workspace.worktree?.repo_name ||
+    (gitRoot && path.basename(gitRoot)) ||
+    path.basename(stablePane?.foreground_cwd || stablePane?.cwd || "");
+  const name = titleCase(source ?? "");
+  if (!name) return null;
+  return isGenericWorkspaceName(name, Boolean(workspace.worktree?.repo_name))
+    ? null
+    : name;
 }
 
 /**
@@ -325,12 +349,15 @@ function boundedProcess(
 }
 
 export function buildModelContext({
-  workspaceName,
+  project: projectName,
   paneContexts,
 }: {
-  workspaceName: string;
+  project: string | null;
   paneContexts: PaneContext[];
 }): NamingContext {
+  // Omitted rather than blanked when unknown, so the model is never invited to
+  // name a tab after a placeholder.
+  const project = projectName ? { project: boundedText(projectName, 80) } : {};
   const focused = paneContexts.find((pane) => pane.focused) ?? paneContexts[0];
   const requests = (focused?.userMessages ?? [])
     .map((text) => boundedText(text, 700))
@@ -344,16 +371,16 @@ export function buildModelContext({
   let context: NamingContext = requests.length
     ? hasTimeline && timeline
       ? {
-          project: boundedText(workspaceName, 80),
+          ...project,
           sessionTimeline: {
             origin: timeline.origin.map((text) => boundedText(text, 700)).filter(Boolean),
             middle: timeline.middle.map((text) => boundedText(text, 700)).filter(Boolean),
             recent: timeline.recent.map((text) => boundedText(text, 700)).filter(Boolean),
           },
         }
-      : { project: boundedText(workspaceName, 80), userRequests: requests }
+      : { ...project, userRequests: requests }
     : {
-        project: boundedText(workspaceName, 80),
+        ...project,
         focusedPane: {
           process: boundedProcess(focused?.process),
           recentOutput: boundedText(focused?.recentOutput, 500),
@@ -371,7 +398,7 @@ export function buildModelContext({
     context = requests.length
       ? hasTimeline && timeline
         ? {
-            project: boundedText(workspaceName, 80),
+            ...project,
             sessionTimeline: {
               origin: timeline.origin.slice(0, 1).map((text) => boundedText(text, 300)),
               middle: timeline.middle.slice(0, 1).map((text) => boundedText(text, 300)),
@@ -379,11 +406,11 @@ export function buildModelContext({
             },
           }
         : {
-            project: boundedText(workspaceName, 80),
+            ...project,
             userRequests: requests.slice(-3).map((text) => boundedText(text, 350)),
           }
       : {
-          project: boundedText(workspaceName, 80),
+          ...project,
           focusedPane: {
             process: boundedProcess(focused?.process, 250),
             recentOutput: boundedText(focused?.recentOutput, 350),

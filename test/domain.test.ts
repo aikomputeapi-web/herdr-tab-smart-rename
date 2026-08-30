@@ -16,6 +16,7 @@ import {
   shouldCallModel,
   shouldRenameAtChange,
   validateTabLabel,
+  projectIdentity,
   workspaceCandidate,
   isGenericWorkspaceName,
   titleCase,
@@ -108,7 +109,7 @@ test("generic workspace folders are detected so task names can replace them", ()
 test("model context keeps weighted session evidence under the hard cap", () => {
   const huge = "x".repeat(20_000);
   const context = buildModelContext({
-    workspaceName: huge,
+    project: huge,
     paneContexts: [
       {
         focused: true,
@@ -235,4 +236,39 @@ test("terminal context stays behind the model cooldown", () => {
     shouldCallModel(state, "t2", context, 1_000_000 + MODEL_RATE_MS * 2).allowed,
     false,
   );
+});
+
+test("the project comes from the checkout, not the workspace label", () => {
+  // Once a workspace is auto-named after its agent, that label must not
+  // shadow the real project or every tab reads as "Claude ...".
+  assert.equal(
+    projectIdentity(
+      { label: "Claude", number: 3 },
+      { cwd: "/home/me/coding/FISHGAME" },
+      "/home/me/coding/FISHGAME",
+    ),
+    // titleCase preserves all-caps as an acronym, so the folder keeps its casing.
+    "FISHGAME",
+  );
+  // A generic container identifies nothing, so the label carries the task alone.
+  assert.equal(
+    projectIdentity({ label: "Claude", number: 3 }, { cwd: "/home/me/coding" }, null),
+    null,
+  );
+  assert.equal(
+    projectIdentity({ label: "1", number: 1, worktree: { repo_name: "herdr" } }),
+    "Herdr",
+  );
+});
+
+test("a project-led label fits the label rules", () => {
+  for (const label of [
+    "FISHGAME Fix Balance",
+    "Herdr Repair Tab Ownership",
+    "Fishgame Fix Balance NaN",
+  ]) {
+    assert.equal(validateTabLabel(label), true, label);
+  }
+  // Still bounded: the project prefix buys one word, not a sentence.
+  assert.equal(validateTabLabel("Fishgame Fix The Player Balance Bug"), false);
 });

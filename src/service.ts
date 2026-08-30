@@ -11,6 +11,7 @@ import {
   markModelSuccess,
   observeStableContext,
   prepareRename,
+  projectIdentity,
   reconcileItem,
   resetOwnership,
   shouldCallModel,
@@ -192,7 +193,7 @@ export class AutoNameService {
   private async contextFor(
     tab: HerdrTab,
     snap: HerdrSnapshot,
-    workspaceName: string,
+    project: string | null,
   ): Promise<{
     focusedPane: HerdrPane | undefined;
     paneContexts: PaneContext[];
@@ -211,7 +212,7 @@ export class AutoNameService {
     return {
       focusedPane,
       paneContexts,
-      context: buildModelContext({ workspaceName, paneContexts }),
+      context: buildModelContext({ project, paneContexts }),
     };
   }
 
@@ -221,23 +222,25 @@ export class AutoNameService {
   ): Promise<{
     stablePane: HerdrPane | undefined;
     workspaceName: string;
+    projectName: string | null;
     workspaceIsGeneric: boolean;
   }> {
     const stablePane = snap.panes.find(
       (pane) => pane.workspace_id === workspace.workspace_id,
     );
-    const needsFallback =
-      !workspace.worktree?.repo_name &&
-      isDefaultLabel(workspace.label, workspace.number);
-    const root = needsFallback
-      ? await this.#dependencies.gitRoot(
+    // Tab labels now lead with the project, so the checkout is needed on every
+    // pass rather than only when the workspace label needs a fallback. A
+    // worktree already carries its repo name and needs no lookup.
+    const root = workspace.worktree?.repo_name
+      ? null
+      : await this.#dependencies.gitRoot(
           stablePane?.foreground_cwd ?? stablePane?.cwd,
-        )
-      : null;
+        );
     const workspaceName = workspaceCandidate(workspace, stablePane, root);
     return {
       stablePane,
       workspaceName,
+      projectName: projectIdentity(workspace, stablePane, root),
       workspaceIsGeneric: isGenericWorkspaceName(
         workspaceName,
         Boolean(workspace.worktree?.repo_name),
@@ -327,16 +330,14 @@ export class AutoNameService {
       };
     }
 
-    const { workspaceName, workspaceIsGeneric } = await this.workspaceDetails(
-      workspace,
-      snap,
-    );
+    const { workspaceName, projectName, workspaceIsGeneric } =
+      await this.workspaceDetails(workspace, snap);
     let tabName: string | null = null;
     let reason = tabManual ? "manual tab ownership" : "";
     let usedModel = false;
 
     if (!tabManual) {
-      const details = await this.contextFor(tab, snap, workspaceName);
+      const details = await this.contextFor(tab, snap, projectName);
       const focusedContext = details.paneContexts.find((pane) => pane.focused);
       const hasUserTask = Boolean(focusedContext?.userMessages.length);
       const heuristic = hasUserTask
