@@ -34,6 +34,22 @@ test("ownership transitions preserve manual names and expected writes", () => {
     reconcileItem({ autoLabel: "Build API" }, "Manual Name").manual,
     true,
   );
+});
+
+test("reboot restore to a default label does not lock manual ownership", () => {
+  const restored = reconcileItem(
+    { autoLabel: "Update Server Info", observedLabel: "Update Server Info" },
+    "1",
+  );
+  // A herdr session restore that drops our rename back to "1" is not a user
+  // rename; the tab must stay eligible for automatic naming.
+  assert.equal(restored.manual, false);
+  assert.equal(restored.autoLabel, undefined);
+  const userRenamed = reconcileItem(
+    { autoLabel: "Update Server Info", observedLabel: "Update Server Info" },
+    "My Custom Name",
+  );
+  assert.equal(userRenamed.manual, true);
   const prepared = prepareRename({}, "Fix Socket Reconnect");
   assert.deepEqual(acknowledgeRename(prepared, "Fix Socket Reconnect"), {
     autoLabel: "Fix Socket Reconnect",
@@ -199,15 +215,16 @@ test("a named tab re-checks on a widening interval, not every message", () => {
     markNamed(state, "t1");
   }
 
-  // Thirty-one further messages cost four requests instead of thirty-one.
-  assert.deepEqual(spent, [3, 7, 15, 31]);
+  // Thirty-one further messages cost six requests instead of thirty-one:
+  // powers of two up to the cap, then one rename per 16 messages.
+  assert.deepEqual(spent, [3, 7, 15, 16, 32]);
 });
 
-test("backoff thresholds land on 1, 3, 7, 15, 31", () => {
-  const hit = Array.from({ length: 32 }, (_, index) => index + 1).filter(
+test("backoff thresholds land on 1, 3, 7, 15, then every 16", () => {
+  const hit = Array.from({ length: 50 }, (_, index) => index + 1).filter(
     shouldRenameAtChange,
   );
-  assert.deepEqual(hit, [1, 3, 7, 15, 31]);
+  assert.deepEqual(hit, [1, 3, 7, 15, 16, 32, 48]);
 });
 
 test("terminal context stays behind the model cooldown", () => {

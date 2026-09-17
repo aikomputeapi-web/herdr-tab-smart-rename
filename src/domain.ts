@@ -120,18 +120,39 @@ export function reconcileItem(
       next.autoLabel = currentLabel;
       delete next.expectedLabel;
       next.manual = false;
+    } else if (
+      isDefaultLabel(currentLabel) &&
+      next.autoLabel === undefined
+    ) {
+      // Reboot/restore path: herdr reports fresh default labels ("1","2",…)
+      // for workspaces and tabs our rename never landed on. Treating that as
+      // a user rename locks the item forever, so retry instead.
+      next.manual = false;
     } else {
       delete next.expectedLabel;
       next.manual = true;
     }
   } else if (next.autoLabel && currentLabel !== next.autoLabel) {
-    next.manual = true;
+    // A default or generic label after a reboot means herdr dropped our
+    // rename (session lost/corrupt at shutdown), not that the user typed
+    // "1" or the folder basename over our name. Fall through to re-earn
+    // the name instead of locking to manual.
+    if (!isDefaultLabel(currentLabel) && !eligible) {
+      next.manual = true;
+    } else {
+      delete next.autoLabel;
+      // auto-rename attempts are fingerprint-gated; forgetting the context
+      // lets the item qualify for a fresh model naming pass.
+      next.manual = false;
+      delete next.observedLabel;
+      return next;
+    }
   } else if (
     record &&
     previousObserved !== undefined &&
     currentLabel !== previousObserved
   ) {
-    next.manual = true;
+    next.manual = !eligible && !isDefaultLabel(currentLabel);
   } else if (!record) {
     next.manual = !eligible;
   }
@@ -456,9 +477,17 @@ export function isTranscriptContext(context: NamingContext): boolean {
  * costs about five requests over a fifty-message session while still noticing a
  * genuine change of subject within a few messages of it happening.
  */
+export const MODEL_CHANGE_CAP = 16;
+
 export function shouldRenameAtChange(changes: number): boolean {
   const next = changes + 1;
-  return next > 0 && (next & (next - 1)) === 0;
+  // Power-of-two growth only up to the cap; past it, every CAP-th context
+  // change earns a rename. Uncapped, a long session needed 2048 user messages
+  // between renames and tabs looked permanently stuck on a stale label.
+  if (next <= MODEL_CHANGE_CAP) {
+    return next > 0 && (next & (next - 1)) === 0;
+  }
+  return changes % MODEL_CHANGE_CAP === 0;
 }
 
 export function shouldCallModel(
