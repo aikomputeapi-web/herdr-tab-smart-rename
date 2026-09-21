@@ -100,6 +100,74 @@ test("jcode journals yield sampled user requests without scaffolding", async () 
   });
 });
 
+test("jcode sidecar transcripts win over user-text-free journals", async () => {
+  await withTempHome(async (home, env) => {
+    const dir = path.join(home, ".jcode", "sessions");
+    await mkdir(dir, { recursive: true });
+    // Live verification found journals hold only tool traffic (user-role
+    // turns are pure tool_result), while the .json sidecar is the real
+    // transcript — the adapter must prefer it when both exist.
+    await writeFile(
+      path.join(dir, "session_raccoon_1758400000000_abc123.journal.jsonl"),
+      lines(
+        {
+          append_messages: [
+            { id: 1, role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: "ok" }] },
+          ],
+        },
+      ),
+    );
+    const sidecar = {
+      id: "s1",
+      short_name: "raccoon",
+      title: null,
+      messages: [
+        {
+          id: "m1",
+          role: "user",
+          content: [
+            { type: "text", text: "<system-reminder>session scaffolding</system-reminder>" },
+            { type: "text", text: "plan the garage shelving layout" },
+          ],
+        },
+        {
+          id: "m2",
+          role: "assistant",
+          content: [{ type: "text", text: "assistant narration" }],
+        },
+        {
+          id: "m3",
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "t", content: "tool output" }],
+        },
+      ],
+    };
+    await writeFile(
+      path.join(dir, "session_raccoon_1758400000000_abc123.json"),
+      JSON.stringify(sidecar),
+    );
+
+    const digest = await sessionDigest(
+      { agent: "jcode", kind: "title", value: "Raccoon" },
+      env,
+    );
+    const requests = [
+      ...digest.timeline.origin,
+      ...digest.timeline.middle,
+      ...digest.timeline.recent,
+    ];
+    assert.ok(
+      requests.includes("plan the garage shelving layout"),
+      "sidecar prompt must reach the namer",
+    );
+    const serialized = JSON.stringify(digest.timeline);
+    assert.ok(!serialized.includes("tool output"), "tool results must not leak");
+    assert.ok(!serialized.includes("assistant narration"));
+    assert.ok(!serialized.includes("session scaffolding"));
+    assert.equal(digest.title, null);
+  });
+});
+
 test("jcode terminal titles bridge to the matching journal", async () => {
   await withTempHome(async (home, env) => {
     const dir = path.join(home, ".jcode", "sessions");
@@ -117,10 +185,28 @@ test("jcode terminal titles bridge to the matching journal", async () => {
     );
 
     assert.deepEqual(jcodeTitleSession("🌐 jcode Raccoon · last ~1m24s"), {
+      agent: "jcode",
       kind: "title",
       value: "Raccoon",
     });
+    assert.deepEqual(jcodeTitleSession("🦧 jcode Orangutan"), {
+      agent: "jcode",
+      kind: "title",
+      value: "Orangutan",
+    });
+    assert.deepEqual(
+      jcodeTitleSession("🌐 jcode Monkey · +265 -7 · last ~9m43s"),
+      { agent: "jcode", kind: "title", value: "Monkey" },
+    );
+    assert.equal(jcodeTitleSession("jcode - wake word check"), null);
+    assert.equal(
+      jcodeTitleSession(
+        "🌐 Permanently fix herdr tab auto-renaming for jcod… · +72 -5 · work ~1h15m",
+      ),
+      null,
+    );
     assert.deepEqual(jcodeTitleSession("🌐 jcode Koala-2 · last ~3s"), {
+      agent: "jcode",
       kind: "title",
       value: "Koala-2",
     });

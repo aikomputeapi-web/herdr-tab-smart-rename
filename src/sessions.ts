@@ -414,13 +414,21 @@ async function locateCodexSession(
 // ---------------------------------------------------------------------------
 
 /**
- * jcode journals are append-only, so the log-structured head/middle/tail window
- * sampler cannot be reused: a byte window slices JSON records mid-object. Every
- * journal line also rewrites the session meta and appends new messages, so
- * whole-line sampling is the only faithful read — and the first user request
- * sits at the very top of the file.
+ * jcode keeps two session files under `~/.jcode/sessions`:
+ *
+ * - `session_<name>_<ts>_<hash>.json` — the real transcript, one JSON object
+ *   with a `messages` array of user/assistant turns.
+ * - `session_<name>_<ts>_<hash>.journal.jsonl` — a side journal of tool calls
+ *   and reasoning. Long line records mean the shared byte-window sampler
+ *   would slice JSON mid-object, and every line rewrites the session meta,
+ *   so whole-line sampling is the only faithful read.
+ *
+ * Every live journal sampled during verification carried zero user text —
+ * all user-role content was tool_result parts — so the sidecar is the
+ * primary source and the journal only a fallback for sessions without one.
  */
 const JCODE_READ_LINE_CAP = 2_000;
+const JCODE_SIDECAR_MAX_BYTES = 12 * 1024 * 1024;
 
 const JcodeUserLineSchema = z.looseObject({
   append_messages: z
@@ -435,6 +443,20 @@ const JcodeUserLineSchema = z.looseObject({
     .optional(),
 });
 
+const JcodeSidecarSchema = z.looseObject({
+  messages: z
+    .array(
+      z.looseObject({
+        // Roles are filtered during extraction: journal-side user turns can
+        // be pure tool_result plumbing, so rejecting the parse on role shape
+        // would throw away the whole transcript over one malformed turn.
+        role: z.string(),
+        content: z.union([z.string(), z.array(TextPartSchema)]),
+      }),
+    )
+    .catch([]),
+});
+
 /**
  * jcode writes user turns whose content array often leads with a session-context
  * system reminder followed by the real prompt. Cleaning parts individually keeps
@@ -442,11 +464,15 @@ const JcodeUserLineSchema = z.looseObject({
  * extractors would smear the reminder prefix over the request and trip the
  * injected-scaffolding filter.
  */
-function jcodeLineMessages(entry: unknown): string[] {
-  const parsed = JcodeUserLineSchema.safeParse(entry);
-  if (!parsed.success || !parsed.data.append_messages) return [];
+function jcodeCollectMessages(
+  messages: ReadonlyArray<{
+    role: string;
+    content: string | ReadonlyArray<{ type: string; text?: string | undefined }>;
+  }>,
+): string[] {
   const out: string[] = [];
-  for (const message of parsed.data.append_messages) {
+  for (const message of messages) {
+    if (message.role !== "user") continue;
     if (typeof message.content === "string") {
       const cleaned = cleanMessage(message.content);
       if (cleaned) out.push(cleaned);
@@ -459,6 +485,12 @@ function jcodeLineMessages(entry: unknown): string[] {
     }
   }
   return out;
+}
+
+function jcodeLineMessages(entry: unknown): string[] {
+  const parsed = JcodeUserLineSchema.safeParse(entry);
+  if (!parsed.success || !parsed.data.append_messages) return [];
+  return jcodeCollectMessages(parsed.data.append_messages);
 }
 
 async function* jcodeLines(
@@ -492,10 +524,60 @@ async function* jcodeLines(
   if (emitted < JCODE_READ_LINE_CAP && carry.trim()) yield carry;
 }
 
-export async function jcodeJournalDigest(
+async function jcodeSidecarDigest(
+  sessionFile: string,
+  env: NodeJS.ProcessEnv,
+): Promise<SessionDigest> {
+  const session = await openSessionFile(sessionFile, jcodeSessionsRoot(env));
+  if (!session) return EMPTY_DIGEST;
+  if (session.size > JCODE_SIDECAR_MAX_BYTES) {
+    await session.handle.close();
+    // Partial JSON cannot be parsed, so oversized transcripts are skipped
+    // rather than read through a lossy window.
+    return EMPTY_DIGEST;
+  }
+  try {
+    const buffer = Buffer.alloc(session.size);
+    let offset = 0;
+    while (offset < session.size) {
+      const { bytesRead } = await session.handle.read(
+        buffer,
+        offset,
+        session.size - offset,
+        offset,
+      );
+      if (!bytesRead) break;
+      offset += bytesRead;
+    }
+    const parsed = JcodeSidecarSchema.safeParse(
+      JSON.parse(buffer.subarray(0, offset).toString("utf8")),
+    );
+    if (!parsed.success) return EMPTY_DIGEST;
+    const messages = jcodeCollectMessages(parsed.data.messages);
+    if (!messages.length) return EMPTY_DIGEST;
+    return {
+      timeline: buildTimeline(messages, messages, messages),
+      // The sidecar `title` field was null in every live session sampled, so
+      // no free fallback title is claimed for this adapter.
+      title: null,
+    };
+  } catch {
+    return EMPTY_DIGEST;
+  } finally {
+    await session.handle.close();
+  }
+}
+
+export async function jcodeTranscriptDigest(
   sessionFile: string | null,
   env: NodeJS.ProcessEnv,
 ): Promise<SessionDigest> {
+  if (!sessionFile) return EMPTY_DIGEST;
+  // The sidecar carries the real conversation; journals only mirror tool
+  // traffic, so they are a last resort.
+  if (sessionFile.endsWith(".json")) {
+    return jcodeSidecarDigest(sessionFile, env);
+  }
   const session = await openSessionFile(sessionFile, jcodeSessionsRoot(env));
   if (!session) return EMPTY_DIGEST;
   try {
@@ -513,8 +595,6 @@ export async function jcodeJournalDigest(
     if (!messages.length) return EMPTY_DIGEST;
     return {
       timeline: buildTimeline(messages, messages, messages),
-      // jcode's session titles are single word-animal names with no task
-      // signal, so no free fallback title for this adapter.
       title: null,
     };
   } finally {
@@ -526,21 +606,30 @@ export async function jcodeJournalDigest(
  * jcode publishes its session's short name in the terminal title
  * ("🌐 jcode Raccoon · last ~1m24s"). Herdr cannot identify the jcode
  * process as an agent, so this title is the only clue which journal belongs
- * to a pane. Anchoring on the trailing "· last" keeps ordinary titles from
- * matching.
+ * to a pane. Live snapshots show three shapes: the activity suffix
+ * ("jcode Raccoon · last ~1m24s"), diff stats before it
+ * ("jcode Monkey · +265 -7 · last ~9m43s"), and idle panes that drop the
+ * suffix entirely ("🦧 jcode Orangutan"). The session name is simply the
+ * word right after "jcode"; a task title that happens to read
+ * "jcode <word>" can be captured by mistake, but that only makes the journal
+ * lookup miss and restores the pre-bridge behavior, so permissiveness is
+ * safe here. The ref carries `agent: "jcode"` so it routes to the jcode
+ * adapter on its own — herdr.ts bridges it verbatim, and a ref without an
+ * agent silently falls out of every adapter (a live regression this return
+ * shape once caused).
  */
-const JCODE_TITLE_PATTERN = /\bjcode\s+([A-Za-z][A-Za-z0-9_-]{1,23})\s+·\s+last/u;
+const JCODE_TITLE_PATTERN = /\bjcode\s+([A-Za-z][A-Za-z0-9_-]{1,24})(?=\s|$)/u;
 
 export function jcodeTitleSession(
   title: string | null | undefined,
-): { kind: string; value: string } | null {
+): { agent: string; kind: string; value: string } | null {
   if (!title) return null;
   const match = JCODE_TITLE_PATTERN.exec(stripAnsi(title));
   if (!match) return null;
-  return { kind: "title", value: match[1]! };
+  return { agent: "jcode", kind: "title", value: match[1]! };
 }
 
-async function locateJcodeJournal(
+async function locateJcodeTranscript(
   shortName: string,
   env: NodeJS.ProcessEnv,
 ): Promise<string | null> {
@@ -548,18 +637,22 @@ async function locateJcodeJournal(
   // Titles show "Raccoon" while journals name files `session_raccoon_<ts>`,
   // so the match must ignore case (a real FS would too on Windows).
   const pattern = `_${shortName.toLowerCase()}_`;
-  const matches = (
-    await readdir(root).catch(() => [] as string[])
-  ).filter(
-    (name) =>
-      name.startsWith("session_") &&
-      name.toLowerCase().includes(pattern) &&
-      name.endsWith(".journal.jsonl"),
+  const names = (await readdir(root).catch(() => [] as string[])).filter(
+    (name) => name.startsWith("session_") && name.toLowerCase().includes(pattern),
   );
   // The creation timestamp sits between the name and the hash, so the
-  // lexicographically last match is the newest session.
-  const newest = matches.sort().at(-1);
-  return newest ? path.join(root, newest) : null;
+  // lexicographically last match is the newest session. Sidecars win over
+  // journals because journals carry no user text.
+  const sidecar = names
+    .filter((name) => /^session_.*\.json$/.test(name))
+    .sort()
+    .at(-1);
+  if (sidecar) return path.join(root, sidecar);
+  const journal = names
+    .filter((name) => name.endsWith(".journal.jsonl"))
+    .sort()
+    .at(-1);
+  return journal ? path.join(root, journal) : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -655,9 +748,9 @@ const ADAPTERS: Record<string, Adapter> = {
     // ref; herdr.ts bridges one from the terminal title instead.
     if (ref.kind !== "title" || !ref.value) return EMPTY_DIGEST;
     const file = await cachedLocate(`jcode:${ref.value}`, () =>
-      locateJcodeJournal(ref.value!, env),
+      locateJcodeTranscript(ref.value!, env),
     );
-    return jcodeJournalDigest(file, env);
+    return jcodeTranscriptDigest(file, env);
   },
   claude: async (ref, env) => {
     if (ref.kind !== "id" || !ref.value) return EMPTY_DIGEST;
