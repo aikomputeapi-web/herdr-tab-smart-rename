@@ -28,8 +28,8 @@ export interface SessionRef {
 export interface SessionDigest {
   timeline: SessionTimeline;
   /**
-   * A title the agent already computed for this session. Free — it costs no
-   * model call — so it serves as the fallback when the namer declines or fails.
+   * A title the agent already computed for this session. Free â€” it costs no
+   * model call â€” so it serves as the fallback when the namer declines or fails.
    */
   title: string | null;
 }
@@ -67,7 +67,7 @@ const INJECTED_PREFIXES = [
   "base directory for this skill:",
   "# agents.md instructions for",
   "this session is being continued from",
-  "## 💡",
+  "## ðŸ’¡",
 ];
 
 function isInjected(text: string): boolean {
@@ -177,7 +177,7 @@ function titleFrom(text: string, extract: TitleExtractor): string | null {
  * Samples the beginning, middle, and end of a transcript. The first request
  * says what the session set out to do, the last says what it is doing now, and
  * the middle keeps a long session from reading as if it only ever did one
- * thing — all without loading a multi-megabyte file into memory.
+ * thing â€” all without loading a multi-megabyte file into memory.
  */
 export function buildTimeline(
   head: string[],
@@ -321,7 +321,7 @@ export const piExtractor: LineExtractor = (entry) => {
 
 /**
  * Resolving an id to a file means scanning a directory tree, so remember the
- * answer. Id-keyed sessions are immutable — a new session gets a new id — so
+ * answer. Id-keyed sessions are immutable â€” a new session gets a new id â€” so
  * a cached path stays correct for the id's lifetime; existence is re-checked
  * on every hit. Title-keyed lookups (jcode) must NOT use this cache: the
  * agent reuses animal names, so a newer session for the same name would be
@@ -373,7 +373,7 @@ async function subdirectories(root: string): Promise<string[]> {
  * Claude Code files a session under a slug of its cwd. Deriving that slug means
  * matching Claude's own escaping rules against a cwd Herdr reports with
  * different casing, so search the project directories for the session id
- * instead — it is a UUID, so the first hit is the right one.
+ * instead â€” it is a UUID, so the first hit is the right one.
  */
 async function locateClaudeSession(
   id: string,
@@ -413,6 +413,81 @@ async function locateCodexSession(
   return null;
 }
 
+const CodexMetaSchema = z.looseObject({
+  type: z.literal("session_meta"),
+  payload: z.looseObject({
+    cwd: z.string(),
+  }),
+});
+
+async function codexRolloutCwd(
+  file: string,
+): Promise<string | null> {
+  const handle = await open(file, "r").catch(() => null);
+  if (!handle) return null;
+  try {
+    // session_meta is the first record, so the head window is enough and the
+    // live file never has to be read end-to-end.
+    const buffer = Buffer.alloc(64 * 1024);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    for (const rawLine of buffer.subarray(0, bytesRead).toString("utf8").split("\n")) {
+      try {
+        const parsed = CodexMetaSchema.safeParse(JSON.parse(rawLine));
+        if (parsed.success) return parsed.data.payload.cwd;
+      } catch {
+        // Partial or non-JSON line; keep scanning.
+      }
+    }
+    return null;
+  } finally {
+    await handle.close();
+  }
+}
+
+function sameCwd(a: string | undefined, b: string | undefined): boolean {
+  if (!a || !b) return false;
+  return path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+}
+
+/**
+ * Codex panes that herdr detected before the first prompt carry no session id,
+ * and unlike jcode their terminal title carries no animal name. The rollout
+ * written at session start records the working directory, so the newest
+ * rollout whose cwd matches the pane's is the conversation to sample. Id-keyed
+ * lookups stay cached because ids are unique; cwd matches must not be â€” a
+ * directory can host back-to-back sessions, and the pane always means the
+ * newest one.
+ */
+async function locateCodexSessionByCwd(
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+): Promise<string | null> {
+  const root = path.join(codexRoot(env), "sessions");
+  // Walk newest-first and limit how deep a pathological tree can stall a sweep.
+  const dateDirs: string[] = [];
+  for (const year of [...(await subdirectories(root))].sort().reverse()) {
+    const yearDir = path.join(root, year);
+    for (const month of [...(await subdirectories(yearDir))].sort().reverse()) {
+      const monthDir = path.join(yearDir, month);
+      for (const day of [...(await subdirectories(monthDir))].sort().reverse()) {
+        dateDirs.push(path.join(monthDir, day));
+        if (dateDirs.length >= 14) break;
+      }
+      if (dateDirs.length >= 14) break;
+    }
+    if (dateDirs.length >= 14) break;
+  }
+  for (const dayDir of dateDirs) {
+    const files = await readdir(dayDir).catch(() => []);
+    for (const name of [...files].sort().reverse()) {
+      if (!name.endsWith(".jsonl")) continue;
+      const file = path.join(dayDir, name);
+      if (sameCwd((await codexRolloutCwd(file)) ?? undefined, cwd)) return file;
+    }
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Journal transcripts (jcode)
 // ---------------------------------------------------------------------------
@@ -420,15 +495,15 @@ async function locateCodexSession(
 /**
  * jcode keeps two session files under `~/.jcode/sessions`:
  *
- * - `session_<name>_<ts>_<hash>.json` — the real transcript, one JSON object
+ * - `session_<name>_<ts>_<hash>.json` â€” the real transcript, one JSON object
  *   with a `messages` array of user/assistant turns.
- * - `session_<name>_<ts>_<hash>.journal.jsonl` — a side journal of tool calls
+ * - `session_<name>_<ts>_<hash>.journal.jsonl` â€” a side journal of tool calls
  *   and reasoning. Long line records mean the shared byte-window sampler
  *   would slice JSON mid-object, and every line rewrites the session meta,
  *   so whole-line sampling is the only faithful read.
  *
- * Every live journal sampled during verification carried zero user text —
- * all user-role content was tool_result parts — so the sidecar is the
+ * Every live journal sampled during verification carried zero user text â€”
+ * all user-role content was tool_result parts â€” so the sidecar is the
  * primary source and the journal only a fallback for sessions without one.
  */
 const JCODE_READ_LINE_CAP = 2_000;
@@ -608,23 +683,23 @@ export async function jcodeTranscriptDigest(
 
 /**
  * jcode publishes its session's short name in the terminal title
- * ("🌐 jcode Raccoon · last ~1m24s"). Herdr cannot identify the jcode
+ * ("ðŸŒ jcode Raccoon Â· last ~1m24s"). Herdr cannot identify the jcode
  * process as an agent, so this title is the only clue which journal belongs
  * to a pane. Live snapshots show three shapes: the activity suffix
- * ("jcode Raccoon · last ~1m24s"), diff stats before it
- * ("jcode Monkey · +265 -7 · last ~9m43s"), and idle panes that drop the
- * suffix entirely ("🦧 jcode Orangutan").
+ * ("jcode Raccoon Â· last ~1m24s"), diff stats before it
+ * ("jcode Monkey Â· +265 -7 Â· last ~9m43s"), and idle panes that drop the
+ * suffix entirely ("ðŸ¦§ jcode Orangutan").
  *
- * When jcode instead shows the conversation subject ("🌐 Permanently fix
- * herdr tab auto-renaming… · +72 -5 · work ~1h15m"), the animal name is not
+ * When jcode instead shows the conversation subject ("ðŸŒ Permanently fix
+ * herdr tab auto-renamingâ€¦ Â· +72 -5 Â· work ~1h15m"), the animal name is not
  * in the title at all, and the word "jcode" appearing anywhere else
- * ("… of the jcode rename w…") is the user's own vocabulary. Anchoring at
+ * ("â€¦ of the jcode rename wâ€¦") is the user's own vocabulary. Anchoring at
  * the title start (allowing only an emoji/symbol prefix) is what separates
  * the two: a match anywhere else is a false capture that resolves to no
- * session — verified live against the real herdr snapshot.
+ * session â€” verified live against the real herdr snapshot.
  *
  * The ref carries `agent: "jcode"` so it routes to the jcode adapter on its
- * own — herdr.ts bridges it verbatim, and a ref without an agent silently
+ * own â€” herdr.ts bridges it verbatim, and a ref without an agent silently
  * falls out of every adapter (a live regression this return shape once
  * caused).
  */
@@ -645,7 +720,7 @@ export function jcodeTitleSession(
  * with identical stems for one session, and reuses animal names across
  * generations. Resolve the newest generation, then return its files in
  * preference order (sidecar, journal) so the adapter can fall back when a
- * file exists but cannot be read usefully — an old session's malformed
+ * file exists but cannot be read usefully â€” an old session's malformed
  * sidecar must still let its own readable journal name the pane, and a
  * broken newest generation must never drag in an older one. Sorting by full
  * name works because the creation timestamp sits between the name and the
@@ -775,7 +850,7 @@ const ADAPTERS: Record<string, Adapter> = {
   jcode: async (ref, env) => {
     // Herdr never identifies jcode as a pane agent and hands out no session
     // ref; herdr.ts bridges one from the terminal title instead. The lookup
-    // is keyed by a reusable animal name, so it is intentionally uncached —
+    // is keyed by a reusable animal name, so it is intentionally uncached â€”
     // a cached path would keep feeding a dead session once the agent rolls
     // the same name into a new one (regression covered in tests). Candidates
     // arrive newest-generation-first; the first file that actually yields
@@ -800,6 +875,16 @@ const ADAPTERS: Record<string, Adapter> = {
     );
   },
   codex: async (ref, env) => {
+    if (ref.kind === "cwd" && ref.value) {
+      // No id and no title clue: herdr saw codex before its first prompt. The
+      // newest rollout matching the pane's cwd is the live conversation.
+      const file = await locateCodexSessionByCwd(ref.value, env);
+      return sampleJsonlSession(
+        file,
+        path.join(codexRoot(env), "sessions"),
+        codexExtractor,
+      );
+    }
     if (ref.kind !== "id" || !ref.value) return EMPTY_DIGEST;
     const file = await cachedLocate(`codex:${ref.value}`, () =>
       locateCodexSession(ref.value!, env),

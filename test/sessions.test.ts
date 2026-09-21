@@ -461,6 +461,72 @@ test("codex rollouts are found by session id under the dated tree", async () => 
   });
 });
 
+const codexMeta = (cwd: string): unknown => ({
+  type: "session_meta",
+  payload: { cwd },
+});
+
+test("a codex pane without a session id is named from the rollout matching its cwd", async () => {
+  await withTempHome(async (home, env) => {
+    const id = "24242424-2424-4242-8242-242424242424";
+    const dir = path.join(home, ".codex", "sessions", "2026", "09", "21");
+    await mkdir(dir, { recursive: true });
+    // Live-style rollout: meta first (recorded at session start), then the
+    // user's first prompt.
+    await writeFile(
+      path.join(dir, `rollout-2026-09-21T05-00-00-${id}.jsonl`),
+      lines(
+        codexMeta("c:\\users\\administrator\\coding"),
+        codexUser("# AGENTS.md instructions for c:\\users\\administrator\\coding"),
+        codexUser("powershell lags when opening, why?"),
+      ),
+    );
+
+    const digest = await sessionDigest(
+      { agent: "codex", kind: "cwd", value: "c:\\users\\administrator\\coding" },
+      env,
+    );
+    assert.ok(
+      digest.timeline.origin.includes("powershell lags when opening, why?"),
+      "the pane's real prompt must reach the namer via the cwd bridge",
+    );
+    // Agent scaffolding stays out.
+    assert.ok(
+      !JSON.stringify(digest.timeline).includes("AGENTS.md instructions"),
+    );
+  });
+});
+
+test("the codex cwd bridge prefers the newest rollout and never spans directories", async () => {
+  await withTempHome(async (home, env) => {
+    const mkdirp = (p: string) => mkdir(p, { recursive: true });
+    const dayA = path.join(home, ".codex", "sessions", "2026", "09", "19");
+    const dayB = path.join(home, ".codex", "sessions", "2026", "09", "21");
+    await Promise.all([mkdirp(dayA), mkdirp(dayB)]);
+    // Older rollout for the same cwd …
+    await writeFile(
+      path.join(dayA, "rollout-2026-09-19T09-00-00-19191919-1919-4191-8191-191919191919.jsonl"),
+      lines(codexMeta("c:\\work\\app"), codexUser("older billing session")),
+    );
+    // … a newer different-project rollout (must not be matched to the pane) …
+    await writeFile(
+      path.join(dayB, "rollout-2026-09-21T04-00-00-21212121-2121-4212-8212-212121212121.jsonl"),
+      lines(codexMeta("c:\\work\\other"), codexUser("unrelated project session")),
+    );
+    // … and the newest rollout for the pane's cwd, which must win.
+    await writeFile(
+      path.join(dayB, "rollout-2026-09-21T05-30-00-22222222-2222-4222-8222-222222222222.jsonl"),
+      lines(codexMeta("c:\\work\\app"), codexUser("fix the reviewer loop")),
+    );
+
+    const digest = await sessionDigest(
+      { agent: "codex", kind: "cwd", value: "C:\\Work\\APP" },
+      env,
+    );
+    assert.deepEqual(digest.timeline.origin, ["fix the reviewer loop"]);
+  });
+});
+
 test("a missing session and an unknown agent both degrade quietly", async () => {
   await withTempHome(async (_home, env) => {
     const missing = await sessionDigest(

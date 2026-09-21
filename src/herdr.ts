@@ -99,7 +99,7 @@ export type HerdrEvent = z.infer<typeof EventEnvelopeSchema>["data"] & {
 };
 
 const TAB_PROGRESS_MARKER = "\u2063";
-const TAB_PROGRESS_FRAMES = ["◇", "◈", "◆", "◈"] as const;
+const TAB_PROGRESS_FRAMES = ["◇", "◆", "◈", "◆"] as const;
 const TAB_PROGRESS_INTERVAL_MS = 120;
 export const WORKSPACE_METADATA_SOURCE = "tab-smart-rename";
 
@@ -335,18 +335,25 @@ export async function focusedPaneContext(
   // shape per agent and returns an empty digest for ones it does not, so an
   // unknown CLI falls back to terminal output instead of losing its name.
   // Herdr cannot detect jcode panes at all, so the terminal title is bridged
-  // in as the session ref when no real one exists.
+  // in as the session ref when no real one exists. Codex panes detected
+  // before the first prompt also carry no ref, and their title carries no
+  // animal name either — their pane cwd bridges instead, and the codex
+  // adapter matches the newest rollout recorded for that directory.
+  const jcodeBridged = jcodeTitleSession(pane.terminal_title);
   const sessionRef = pane.agent_session
     ? {
         agent: pane.agent,
         kind: pane.agent_session.kind,
         value: pane.agent_session.value,
       }
-    : jcodeTitleSession(pane.terminal_title) ?? {
-        agent: pane.agent,
-        kind: undefined,
-        value: undefined,
-      };
+    : jcodeBridged ??
+      (pane.agent?.toLowerCase() === "codex" && pane.cwd
+        ? { agent: pane.agent, kind: "cwd", value: pane.cwd }
+        : {
+            agent: pane.agent,
+            kind: undefined,
+            value: undefined,
+          });
   const [process, recentOutput, digest] = await Promise.all([
     paneProcess(pane.pane_id, env),
     paneRecent(pane.pane_id, env),
