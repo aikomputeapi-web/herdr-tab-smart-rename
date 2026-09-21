@@ -250,6 +250,15 @@ test("jcode terminal titles bridge to the matching journal", async () => {
       value: "Koala-2",
     });
     assert.equal(jcodeTitleSession("bun run dev -- watch mode"), null);
+    // Live second format (wY Skunk tab, 2026-09-21): jcode titles the session
+    // with a directory-model qualifier between "jcode" and the animal name.
+    assert.deepEqual(
+      jcodeTitleSession("🌐 jcode/meadow Skunk · +764 -139 · work ~1m32s"),
+      { agent: "jcode", kind: "title", value: "Skunk" },
+    );
+    // The qualifier is optional and exactly one; two tokens is not a real
+    // format, and a prose qualifier must stay rejected.
+    assert.equal(jcodeTitleSession("🌐 jcode/meadow/redwood Skunk"), null);
     const digest = await sessionDigest(
       { agent: "jcode", kind: "title", value: "Raccoon" },
       env,

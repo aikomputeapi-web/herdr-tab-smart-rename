@@ -704,7 +704,7 @@ export async function jcodeTranscriptDigest(
  * caused).
  */
 const JCODE_TITLE_PATTERN =
-  /^[\p{Extended_Pictographic}\u2190-\u21FF\u2500-\u27BF\u2B00-\u2BFF\uFE0F\u200D\s]*jcode\s+([A-Za-z][A-Za-z0-9_-]{1,24})(?=\s|$)/u;
+  /^[\p{Extended_Pictographic}\u2190-\u21FF\u2500-\u27BF\u2B00-\u2BFF\uFE0F\u200D\s]*jcode(?:\/[A-Za-z][A-Za-z0-9_-]{1,24})?\s+([A-Za-z][A-Za-z0-9_-]{1,24})(?=\s|$)/u;
 
 export function jcodeTitleSession(
   title: string | null | undefined,
