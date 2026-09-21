@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { open, readdir, realpath, stat, type FileHandle } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import stripAnsi from "strip-ansi";
 import { z } from "zod";
 import { type SessionTimeline } from "./domain.ts";
 import { boundedText } from "./text.ts";
@@ -341,6 +342,10 @@ function home(env: NodeJS.ProcessEnv): string {
   return env.HOME || os.homedir();
 }
 
+function jcodeSessionsRoot(env: NodeJS.ProcessEnv): string {
+  return path.join(home(env), ".jcode", "sessions");
+}
+
 function claudeRoot(env: NodeJS.ProcessEnv): string {
   return env.CLAUDE_CONFIG_DIR || path.join(home(env), ".claude");
 }
@@ -402,6 +407,159 @@ async function locateCodexSession(
     }
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Journal transcripts (jcode)
+// ---------------------------------------------------------------------------
+
+/**
+ * jcode journals are append-only, so the log-structured head/middle/tail window
+ * sampler cannot be reused: a byte window slices JSON records mid-object. Every
+ * journal line also rewrites the session meta and appends new messages, so
+ * whole-line sampling is the only faithful read — and the first user request
+ * sits at the very top of the file.
+ */
+const JCODE_READ_LINE_CAP = 2_000;
+
+const JcodeUserLineSchema = z.looseObject({
+  append_messages: z
+    .array(
+      z.looseObject({
+        // Assistant turns narrate what already happened; the namer wants what
+        // the user asked for, so anything else is discarded here.
+        role: z.literal("user"),
+        content: z.union([z.string(), z.array(TextPartSchema)]),
+      }),
+    )
+    .optional(),
+});
+
+/**
+ * jcode writes user turns whose content array often leads with a session-context
+ * system reminder followed by the real prompt. Cleaning parts individually keeps
+ * the reminder out while the user's own words survive; joining like the other
+ * extractors would smear the reminder prefix over the request and trip the
+ * injected-scaffolding filter.
+ */
+function jcodeLineMessages(entry: unknown): string[] {
+  const parsed = JcodeUserLineSchema.safeParse(entry);
+  if (!parsed.success || !parsed.data.append_messages) return [];
+  const out: string[] = [];
+  for (const message of parsed.data.append_messages) {
+    if (typeof message.content === "string") {
+      const cleaned = cleanMessage(message.content);
+      if (cleaned) out.push(cleaned);
+      continue;
+    }
+    for (const part of message.content) {
+      if (!TEXT_PART_TYPES.has(part.type) || !part.text) continue;
+      const cleaned = cleanMessage(part.text);
+      if (cleaned) out.push(cleaned);
+    }
+  }
+  return out;
+}
+
+async function* jcodeLines(
+  handle: FileHandle,
+  size: number,
+): AsyncGenerator<string> {
+  const CHUNK = 256 * 1024;
+  // A chunk boundary can split a multibyte UTF-8 sequence; stream decoding
+  // carries the partial sequence into the next chunk instead of mangling it.
+  const decoder = new TextDecoder("utf8");
+  let offset = 0;
+  let carry = "";
+  let emitted = 0;
+  while (offset < size && emitted < JCODE_READ_LINE_CAP) {
+    const count = Math.min(CHUNK, size - offset);
+    const buffer = Buffer.alloc(count);
+    const { bytesRead } = await handle.read(buffer, 0, count, offset);
+    if (bytesRead === 0) break;
+    offset += bytesRead;
+    carry += decoder.decode(buffer.subarray(0, bytesRead), { stream: true });
+    let index = carry.indexOf("\n");
+    while (index !== -1) {
+      yield carry.slice(0, index);
+      emitted += 1;
+      carry = carry.slice(index + 1);
+      if (emitted >= JCODE_READ_LINE_CAP) return;
+      index = carry.indexOf("\n");
+    }
+  }
+  carry += decoder.decode();
+  if (emitted < JCODE_READ_LINE_CAP && carry.trim()) yield carry;
+}
+
+export async function jcodeJournalDigest(
+  sessionFile: string | null,
+  env: NodeJS.ProcessEnv,
+): Promise<SessionDigest> {
+  const session = await openSessionFile(sessionFile, jcodeSessionsRoot(env));
+  if (!session) return EMPTY_DIGEST;
+  try {
+    const messages: string[] = [];
+    for await (const raw of jcodeLines(session.handle, session.size)) {
+      if (!raw.trim()) continue;
+      let entry: unknown;
+      try {
+        entry = JSON.parse(raw);
+      } catch {
+        continue;
+      }
+      messages.push(...jcodeLineMessages(entry));
+    }
+    if (!messages.length) return EMPTY_DIGEST;
+    return {
+      timeline: buildTimeline(messages, messages, messages),
+      // jcode's session titles are single word-animal names with no task
+      // signal, so no free fallback title for this adapter.
+      title: null,
+    };
+  } finally {
+    await session.handle.close();
+  }
+}
+
+/**
+ * jcode publishes its session's short name in the terminal title
+ * ("🌐 jcode Raccoon · last ~1m24s"). Herdr cannot identify the jcode
+ * process as an agent, so this title is the only clue which journal belongs
+ * to a pane. Anchoring on the trailing "· last" keeps ordinary titles from
+ * matching.
+ */
+const JCODE_TITLE_PATTERN = /\bjcode\s+([A-Za-z][A-Za-z0-9_-]{1,23})\s+·\s+last/u;
+
+export function jcodeTitleSession(
+  title: string | null | undefined,
+): { kind: string; value: string } | null {
+  if (!title) return null;
+  const match = JCODE_TITLE_PATTERN.exec(stripAnsi(title));
+  if (!match) return null;
+  return { kind: "title", value: match[1]! };
+}
+
+async function locateJcodeJournal(
+  shortName: string,
+  env: NodeJS.ProcessEnv,
+): Promise<string | null> {
+  const root = jcodeSessionsRoot(env);
+  // Titles show "Raccoon" while journals name files `session_raccoon_<ts>`,
+  // so the match must ignore case (a real FS would too on Windows).
+  const pattern = `_${shortName.toLowerCase()}_`;
+  const matches = (
+    await readdir(root).catch(() => [] as string[])
+  ).filter(
+    (name) =>
+      name.startsWith("session_") &&
+      name.toLowerCase().includes(pattern) &&
+      name.endsWith(".journal.jsonl"),
+  );
+  // The creation timestamp sits between the name and the hash, so the
+  // lexicographically last match is the newest session.
+  const newest = matches.sort().at(-1);
+  return newest ? path.join(root, newest) : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -492,6 +650,15 @@ type Adapter = (
  * stores transcripts in a shape nothing else uses, an extractor above.
  */
 const ADAPTERS: Record<string, Adapter> = {
+  jcode: async (ref, env) => {
+    // Herdr never identifies jcode as a pane agent and hands out no session
+    // ref; herdr.ts bridges one from the terminal title instead.
+    if (ref.kind !== "title" || !ref.value) return EMPTY_DIGEST;
+    const file = await cachedLocate(`jcode:${ref.value}`, () =>
+      locateJcodeJournal(ref.value!, env),
+    );
+    return jcodeJournalDigest(file, env);
+  },
   claude: async (ref, env) => {
     if (ref.kind !== "id" || !ref.value) return EMPTY_DIGEST;
     const file = await cachedLocate(`claude:${ref.value}`, () =>

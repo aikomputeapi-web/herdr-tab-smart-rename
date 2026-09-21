@@ -4,7 +4,11 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { agentTitleLabel } from "../src/domain.ts";
-import { hasSessionAdapter, sessionDigest } from "../src/sessions.ts";
+import {
+  hasSessionAdapter,
+  jcodeTitleSession,
+  sessionDigest,
+} from "../src/sessions.ts";
 
 const lines = (...entries: unknown[]): string =>
   `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
@@ -41,6 +45,125 @@ async function withTempHome(
     await rm(home, { recursive: true, force: true });
   }
 }
+
+test("jcode journals yield sampled user requests without scaffolding", async () => {
+  await withTempHome(async (home, env) => {
+    const dir = path.join(home, ".jcode", "sessions");
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      path.join(dir, "session_raccoon_1758400000000_abc123.journal.jsonl"),
+      lines(
+        { meta: { short_name: "Raccoon", status: "active" } },
+        {
+          append_messages: [
+            {
+              id: 1,
+              role: "user",
+              content: [
+                { type: "text", text: "<system-reminder>context scaffold</system-reminder>" },
+                { type: "text", text: "split the billing module" },
+              ],
+            },
+          ],
+        },
+        {
+          append_messages: [
+            { id: 2, role: "assistant", content: [{ type: "text", text: "assistant noise" }] },
+          ],
+        },
+        {
+          append_messages: [
+            { id: 3, role: "user", content: [{ type: "text", text: "now cover it with a test" }] },
+          ],
+        },
+      ),
+    );
+
+    const digest = await sessionDigest(
+      { agent: "jcode", kind: "title", value: "Raccoon" },
+      env,
+    );
+    const requests = [
+      ...digest.timeline.origin,
+      ...digest.timeline.middle,
+      ...digest.timeline.recent,
+    ];
+    assert.ok(requests.includes("split the billing module"));
+    assert.ok(requests.includes("now cover it with a test"));
+    assert.ok(
+      !JSON.stringify(digest.timeline).includes("context scaffold"),
+      "system-reminder scaffolding must not reach the namer",
+    );
+    assert.ok(!JSON.stringify(digest.timeline).includes("assistant noise"));
+    assert.equal(digest.title, null);
+    assert.equal(hasSessionAdapter("jcode"), true);
+  });
+});
+
+test("jcode terminal titles bridge to the matching journal", async () => {
+  await withTempHome(async (home, env) => {
+    const dir = path.join(home, ".jcode", "sessions");
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      path.join(dir, "session_raccoon_1758400000000_abc123.journal.jsonl"),
+      lines(
+        { meta: { short_name: "Raccoon" } },
+        {
+          append_messages: [
+            { id: 1, role: "user", content: [{ type: "text", text: "audit the uploader retries" }] },
+          ],
+        },
+      ),
+    );
+
+    assert.deepEqual(jcodeTitleSession("🌐 jcode Raccoon · last ~1m24s"), {
+      kind: "title",
+      value: "Raccoon",
+    });
+    assert.deepEqual(jcodeTitleSession("🌐 jcode Koala-2 · last ~3s"), {
+      kind: "title",
+      value: "Koala-2",
+    });
+    assert.equal(jcodeTitleSession("bun run dev -- watch mode"), null);
+    const digest = await sessionDigest(
+      { agent: "jcode", kind: "title", value: "Raccoon" },
+      env,
+    );
+    assert.ok(
+      JSON.stringify(digest.timeline).includes("audit the uploader retries"),
+    );
+  });
+});
+
+test("unknown jcode sessions degrade quietly like the other adapters", async () => {
+  await withTempHome(async (home, env) => {
+    const dir = path.join(home, ".jcode", "sessions");
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      path.join(dir, "session_owl_1758000000000_deadbeef.journal.jsonl"),
+      lines(
+        { meta: { short_name: "Owl" } },
+        {
+          append_messages: [
+            { id: 1, role: "user", content: "string content still counts" },
+          ],
+        },
+      ),
+    );
+
+    const missing = await sessionDigest(
+      { agent: "jcode", kind: "title", value: "Emu" },
+      env,
+    );
+    assert.deepEqual(missing.timeline, { origin: [], middle: [], recent: [] });
+
+    const found = await sessionDigest(
+      { agent: "jcode", kind: "title", value: "Owl" },
+      env,
+    );
+    assert.ok(JSON.stringify(found.timeline).includes("string content still counts"));
+  });
+});
 
 test("claude transcripts yield the user's own requests and title", async () => {
   await withTempHome(async (home, env) => {

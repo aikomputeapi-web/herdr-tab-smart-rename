@@ -1,7 +1,7 @@
 import net, { type Socket } from "node:net";
 import { z } from "zod";
 import { type PaneContext } from "./domain.ts";
-import { sessionDigest } from "./sessions.ts";
+import { sessionDigest, jcodeTitleSession } from "./sessions.ts";
 import { boundedText } from "./text.ts";
 
 const WorkspaceSchema = z.looseObject({
@@ -34,6 +34,8 @@ const PaneSchema = z.looseObject({
   agent_session: z
     .object({ kind: z.string(), value: z.string() })
     .optional(),
+  /** Latest OSC title; the only session clue for agents herdr cannot detect. */
+  terminal_title: z.string().optional(),
 });
 
 const LayoutSchema = z.looseObject({
@@ -332,17 +334,23 @@ export async function focusedPaneContext(
   // Every agent CLI keeps a transcript somewhere; `sessionDigest` knows the
   // shape per agent and returns an empty digest for ones it does not, so an
   // unknown CLI falls back to terminal output instead of losing its name.
+  // Herdr cannot detect jcode panes at all, so the terminal title is bridged
+  // in as the session ref when no real one exists.
+  const sessionRef = pane.agent_session
+    ? {
+        agent: pane.agent,
+        kind: pane.agent_session.kind,
+        value: pane.agent_session.value,
+      }
+    : jcodeTitleSession(pane.terminal_title) ?? {
+        agent: pane.agent,
+        kind: undefined,
+        value: undefined,
+      };
   const [process, recentOutput, digest] = await Promise.all([
     paneProcess(pane.pane_id, env),
     paneRecent(pane.pane_id, env),
-    sessionDigest(
-      {
-        agent: pane.agent,
-        kind: pane.agent_session?.kind,
-        value: pane.agent_session?.value,
-      },
-      env,
-    ),
+    sessionDigest(sessionRef, env),
   ]);
   const sessionMessages = digest.timeline;
   return {
