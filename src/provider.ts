@@ -226,11 +226,33 @@ export async function loadNamingPrompt(
 }
 
 function parseSuggestion(text: string): NameSuggestion {
-  const cleaned = text
+  // Models occasionally wrap JSON in single backticks, triple fences with
+  // leading prose ("Looking at the context: ```json ... ```"), or emit stray
+  // markdown around the payload. Pull the first balanced {...} object out of
+  // the response so those cases parse instead of throwing.
+  const fenced = text
     .replace(/^```(?:json)?\s*/i, "")
     .replace(/\s*```$/i, "")
     .trim();
-  const output = ModelOutputSchema.parse(JSON.parse(cleaned));
+  const candidates: string[] = [fenced];
+  if (!fenced.startsWith("{")) {
+    const start = fenced.indexOf("{");
+    if (start !== -1) {
+      const end = fenced.lastIndexOf("}");
+      if (end > start) candidates.push(fenced.slice(start, end + 1));
+    }
+  }
+  let output: z.infer<typeof ModelOutputSchema> | undefined;
+  let lastError: unknown;
+  for (const candidate of candidates) {
+    try {
+      output = ModelOutputSchema.parse(JSON.parse(candidate));
+      break;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  if (output === undefined) throw lastError;
   if (output.tab === null) {
     return { tab: null, reason: sanitizeText(output.reason) };
   }

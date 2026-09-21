@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { appendFile, chmod } from "node:fs/promises";
+import { appendFile, chmod, writeFile } from "node:fs/promises";
 import { type Socket } from "node:net";
 import {
   snapshot,
@@ -41,11 +41,44 @@ export async function runWorker(
   const paths = statePaths(stateDir);
   const service = createService({ stateDir, env });
 
+  // Trim an unbounded worker log so a long-running worker cannot slowly fill the
+  // disk and trigger the ENOSPC rename storm that originally stalled this plugin.
+  const trimLog = async (): Promise<void> => {
+    try {
+      const file = Bun.file(paths.log);
+      if (!(await file.exists())) return;
+      const maxBytes = 1 * 1024 * 1024; // keep at most ~1 MiB
+      if (file.size <= maxBytes) return;
+      const tail = await file
+        .text()
+        .then((text) => text.slice(-maxBytes))
+        .catch(() => null);
+      if (tail === null) return;
+      const cut = tail.indexOf("\n");
+      const kept = cut === -1 ? tail : tail.slice(cut + 1);
+      await writeFile(paths.log, kept, { mode: 0o600 }).catch(() => {});
+      await chmod(paths.log, 0o600).catch(() => {});
+    } catch {
+      // log trimming is best-effort; never fatal
+    }
+  };
+
   const log = async (message: string): Promise<void> => {
     await appendFile(paths.log, `${new Date().toISOString()} ${message}\n`, {
       mode: 0o600,
     }).catch(() => {});
     await chmod(paths.log, 0o600).catch(() => {});
+    // Opportunistic trim — only when the log is non-trivially large, so the
+    // steady-state cost is a single stat per log line.
+    try {
+      const file = Bun.file(paths.log);
+      if (await file.exists()) {
+        const size = file.size;
+        if (size > 2 * 1024 * 1024) await trimLog();
+      }
+    } catch {
+      // ignore
+    }
   };
 
   // Herdr's server can be absent at logon, or left on an older wire protocol by a
@@ -211,6 +244,7 @@ export async function runWorker(
   });
 
   await log(`started pid=${process.pid}`);
+  await trimLog();
   queueSweep();
   sweepTimer = setInterval(queueSweep, SWEEP_INTERVAL_MS);
   connect();
