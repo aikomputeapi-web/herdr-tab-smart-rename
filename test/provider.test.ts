@@ -140,6 +140,33 @@ test("namer sends one bounded completion and validates model output", async () =
     async () => '{"tab":"bad","reason":"bad"}',
   );
   await assert.rejects(invalid.suggest(context), /invalid model tab label/);
+
+  // Models intermittently emit the right task with a lowercase first word
+  // (observed live: "coding Verify Labels", "jcode Connect OpenAI"). The
+  // before/after below: the casing is repaired deterministically instead of
+  // discarding the model's work and burning an attempt.
+  const repairable = new AiSdkNamer(
+    { SMART_RENAME_API_KEY: "standalone-key" },
+    async () => '{"tab":"coding Verify Labels","reason":"lowercase again"}',
+  );
+  assert.deepEqual(await repairable.suggest(context), {
+    tab: "Coding Verify Labels",
+    reason: "lowercase again",
+  });
+  const mixed = new AiSdkNamer(
+    { SMART_RENAME_API_KEY: "standalone-key" },
+    async () => '{"tab":"jcode Connect OpenAI","reason":"retro failure"}',
+  );
+  assert.deepEqual(await mixed.suggest(context), {
+    tab: "Jcode Connect OpenAI",
+    reason: "retro failure",
+  });
+  // Repair is not a bailout: genuinely malformed labels still fail loudly.
+  const stillBroken = new AiSdkNamer(
+    { SMART_RENAME_API_KEY: "standalone-key" },
+    async () => '{"tab":"x","reason":"too short"}',
+  );
+  await assert.rejects(stillBroken.suggest(context), /invalid model tab label/);
 });
 
 test("provider transport enforces the output-token ceiling without external network", async () => {

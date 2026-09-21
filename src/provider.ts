@@ -7,6 +7,7 @@ import { z } from "zod";
 import {
   type NameSuggestion,
   type NamingContext,
+  titleCase,
   validateTabLabel,
 } from "./domain.ts";
 import { sanitizeText } from "./text.ts";
@@ -256,8 +257,33 @@ function parseSuggestion(text: string): NameSuggestion {
   if (output.tab === null) {
     return { tab: null, reason: sanitizeText(output.reason) };
   }
-  if (!validateTabLabel(output.tab)) {
-    throw new Error(`invalid model tab label: ${JSON.stringify(output.tab)}`);
+  // A boolean (not the type predicate) keeps `output.tab` narrowable here;
+  // testing the predicate directly would narrow the failing branch to never.
+  const valid = validateTabLabel(output.tab);
+  if (!valid) {
+    // Models intermittently emit the right task in the wrong case (live
+    // failures: "coding Verify Labels", "jcode Connect OpenAI"), which the
+    // otherwise-fatal validation rejects on the first lowercase word. Casing
+    // is the one failure mode that can be repaired deterministically without
+    // inventing content. Stage 1 capitalises only the leading character of
+    // each lowercase word and leaves every interior ("OpenAI", "myAItool")
+    // untouched, so it cannot corrupt anything; stage 2 falls back to
+    // titleCase, which downcases mixed-case acronyms but rescues shapes
+    // stage 1 cannot. A repaired label must re-pass the same validation, so
+    // anything genuinely malformed (length, word count, characters) still
+    // throws below.
+    const firstPass = output.tab
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((word) =>
+        /^[A-Z0-9]/.test(word) ? word : word[0]!.toUpperCase() + word.slice(1),
+      )
+      .join(" ");
+    const repaired = validateTabLabel(firstPass) ? firstPass : titleCase(output.tab);
+    if (!validateTabLabel(repaired)) {
+      throw new Error(`invalid model tab label: ${JSON.stringify(output.tab)}`);
+    }
+    return { tab: sanitizeText(repaired), reason: sanitizeText(output.reason) };
   }
   return { tab: sanitizeText(output.tab), reason: sanitizeText(output.reason) };
 }
