@@ -613,16 +613,23 @@ export async function jcodeTranscriptDigest(
  * to a pane. Live snapshots show three shapes: the activity suffix
  * ("jcode Raccoon · last ~1m24s"), diff stats before it
  * ("jcode Monkey · +265 -7 · last ~9m43s"), and idle panes that drop the
- * suffix entirely ("🦧 jcode Orangutan"). The session name is simply the
- * word right after "jcode"; a task title that happens to read
- * "jcode <word>" can be captured by mistake, but that only makes the journal
- * lookup miss and restores the pre-bridge behavior, so permissiveness is
- * safe here. The ref carries `agent: "jcode"` so it routes to the jcode
- * adapter on its own — herdr.ts bridges it verbatim, and a ref without an
- * agent silently falls out of every adapter (a live regression this return
- * shape once caused).
+ * suffix entirely ("🦧 jcode Orangutan").
+ *
+ * When jcode instead shows the conversation subject ("🌐 Permanently fix
+ * herdr tab auto-renaming… · +72 -5 · work ~1h15m"), the animal name is not
+ * in the title at all, and the word "jcode" appearing anywhere else
+ * ("… of the jcode rename w…") is the user's own vocabulary. Anchoring at
+ * the title start (allowing only an emoji/symbol prefix) is what separates
+ * the two: a match anywhere else is a false capture that resolves to no
+ * session — verified live against the real herdr snapshot.
+ *
+ * The ref carries `agent: "jcode"` so it routes to the jcode adapter on its
+ * own — herdr.ts bridges it verbatim, and a ref without an agent silently
+ * falls out of every adapter (a live regression this return shape once
+ * caused).
  */
-const JCODE_TITLE_PATTERN = /\bjcode\s+([A-Za-z][A-Za-z0-9_-]{1,24})(?=\s|$)/u;
+const JCODE_TITLE_PATTERN =
+  /^[\p{Extended_Pictographic}\u2190-\u21FF\u2500-\u27BF\u2B00-\u2BFF\uFE0F\u200D\s]*jcode\s+([A-Za-z][A-Za-z0-9_-]{1,24})(?=\s|$)/u;
 
 export function jcodeTitleSession(
   title: string | null | undefined,

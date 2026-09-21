@@ -233,6 +233,17 @@ test("jcode terminal titles bridge to the matching journal", async () => {
       ),
       null,
     );
+    // Subject-form titles put the user's own prose after the name text; a
+    // mid-sentence "jcode" is the user's vocabulary, not a session name.
+    assert.equal(
+      jcodeTitleSession(
+        "🌐 Continue deeper validation of the jcode rename w… · +1080 -405",
+      ),
+      null,
+      "mid-sentence jcode in a subject title must not be captured",
+    );
+    assert.equal(jcodeTitleSession("fix bug in jcode sessions adapter"), null);
+    assert.equal(jcodeTitleSession("migrate jcode Monkey config"), null);
     assert.deepEqual(jcodeTitleSession("🌐 jcode Koala-2 · last ~3s"), {
       agent: "jcode",
       kind: "title",
