@@ -321,8 +321,12 @@ export const piExtractor: LineExtractor = (entry) => {
 
 /**
  * Resolving an id to a file means scanning a directory tree, so remember the
- * answer. Sessions do not move, and a stale hit is re-validated by the open
- * that follows it.
+ * answer. Id-keyed sessions are immutable — a new session gets a new id — so
+ * a cached path stays correct for the id's lifetime; existence is re-checked
+ * on every hit. Title-keyed lookups (jcode) must NOT use this cache: the
+ * agent reuses animal names, so a newer session for the same name would be
+ * shadowed by the stale path (verified live-style in test with two
+ * generations of "raccoon").
  */
 const locationCache = new Map<string, string>();
 
@@ -629,30 +633,48 @@ export function jcodeTitleSession(
   return { agent: "jcode", kind: "title", value: match[1]! };
 }
 
+/**
+ * jcode writes transcript pairs (`<stem>.json` sidecar + `<stem>.journal.jsonl`)
+ * with identical stems for one session, and reuses animal names across
+ * generations. Resolve the newest generation, then return its files in
+ * preference order (sidecar, journal) so the adapter can fall back when a
+ * file exists but cannot be read usefully — an old session's malformed
+ * sidecar must still let its own readable journal name the pane, and a
+ * broken newest generation must never drag in an older one. Sorting by full
+ * name works because the creation timestamp sits between the name and the
+ * hash.
+ */
 async function locateJcodeTranscript(
   shortName: string,
   env: NodeJS.ProcessEnv,
-): Promise<string | null> {
+): Promise<string[]> {
   const root = jcodeSessionsRoot(env);
   // Titles show "Raccoon" while journals name files `session_raccoon_<ts>`,
-  // so the match must ignore case (a real FS would too on Windows).
+  // so the match must ignore case (a real FS would too on Windows). Only the
+  // two transcript extensions count: jcode also drops `.bak` backups whose
+  // otherwise-identical names sort last and would shadow the real generation
+  // (live data had `session_camel_..._.bak` beating `session_camel_..._.json`).
   const pattern = `_${shortName.toLowerCase()}_`;
   const names = (await readdir(root).catch(() => [] as string[])).filter(
-    (name) => name.startsWith("session_") && name.toLowerCase().includes(pattern),
+    (name) =>
+      name.startsWith("session_") &&
+      name.toLowerCase().includes(pattern) &&
+      (name.endsWith(".json") || name.endsWith(".journal.jsonl")),
   );
-  // The creation timestamp sits between the name and the hash, so the
-  // lexicographically last match is the newest session. Sidecars win over
-  // journals because journals carry no user text.
-  const sidecar = names
-    .filter((name) => /^session_.*\.json$/.test(name))
-    .sort()
-    .at(-1);
-  if (sidecar) return path.join(root, sidecar);
-  const journal = names
-    .filter((name) => name.endsWith(".journal.jsonl"))
-    .sort()
-    .at(-1);
-  return journal ? path.join(root, journal) : null;
+  const generations = new Map<string, { sidecar?: string; journal?: string }>();
+  for (const name of names) {
+    const stem = name.replace(/\.journal\.jsonl$/, "").replace(/\.json$/, "");
+    const entry = generations.get(stem) ?? {};
+    if (name.endsWith(".json")) entry.sidecar = name;
+    else if (name.endsWith(".journal.jsonl")) entry.journal = name;
+    generations.set(stem, entry);
+  }
+  const newestStem = [...generations.keys()].sort().at(-1);
+  if (!newestStem) return [];
+  const newest = generations.get(newestStem)!;
+  return [newest.sidecar, newest.journal]
+    .filter((name): name is string => Boolean(name))
+    .map((name) => path.join(root, name));
 }
 
 // ---------------------------------------------------------------------------
@@ -745,12 +767,18 @@ type Adapter = (
 const ADAPTERS: Record<string, Adapter> = {
   jcode: async (ref, env) => {
     // Herdr never identifies jcode as a pane agent and hands out no session
-    // ref; herdr.ts bridges one from the terminal title instead.
+    // ref; herdr.ts bridges one from the terminal title instead. The lookup
+    // is keyed by a reusable animal name, so it is intentionally uncached —
+    // a cached path would keep feeding a dead session once the agent rolls
+    // the same name into a new one (regression covered in tests). Candidates
+    // arrive newest-generation-first; the first file that actually yields
+    // user text wins, so a malformed sidecar falls through to its journal.
     if (ref.kind !== "title" || !ref.value) return EMPTY_DIGEST;
-    const file = await cachedLocate(`jcode:${ref.value}`, () =>
-      locateJcodeTranscript(ref.value!, env),
-    );
-    return jcodeTranscriptDigest(file, env);
+    for (const file of await locateJcodeTranscript(ref.value, env)) {
+      const digest = await jcodeTranscriptDigest(file, env);
+      if (!isEmptyDigest(digest)) return digest;
+    }
+    return EMPTY_DIGEST;
   },
   claude: async (ref, env) => {
     if (ref.kind !== "id" || !ref.value) return EMPTY_DIGEST;
