@@ -5,17 +5,20 @@
 // as a measurable failure rate instead of silently degrading tab names.
 //
 // Usage:
-//   bun stress-provider.ts [iterations]   (default 8)
+//   cd /d C:\Users\Administrator\herdr-tab-smart-rename-win
+//   bun tools/stress-provider.ts [iterations]   (default 8)
 //
-// Reports valid-label / abstain / invalid / failed counts plus latency, and
-// exits non-zero when any call fails or produces a label the plugin would drop.
+// Reports valid-label / abstain / invalid / failed counts plus latency.
+// Exit codes: 0 clean, 1 real failures or invalid labels, 2 rate limited
+// (reported separately so a provider cap is never mistaken for a plugin bug,
+// but still non-zero so CI or a wrapper notices).
 //
 // Distinct from the real worker: this fires back-to-back with no cooldown, so
 // it deliberately provokes the provider's rate limit. The worker itself is
 // capped at one model attempt per 10 minutes per tab, so real usage sees far
 // less traffic than this harness.
-import { loadProviderConfig, AiSdkNamer } from "./src/provider.ts";
-import { validateTabLabel, type NamingContext } from "./src/domain.ts";
+import { loadProviderConfig, AiSdkNamer } from "../src/provider.ts";
+import { validateTabLabel, type NamingContext } from "../src/domain.ts";
 
 const CONFIG_DIR =
   process.env.SMART_RENAME_CONFIG_DIR ??
@@ -85,7 +88,12 @@ const latencies: number[] = [];
 const errors = new Map<string, number>();
 
 for (let i = 0; i < iterations; i += 1) {
-  const { label, context } = scenarios[i % scenarios.length];
+  // `i % scenarios.length` is always in range while `scenarios` is non-empty,
+  // but noUncheckedIndexedAccess cannot prove that, so fall back explicitly
+  // rather than asserting and risking a crash on an empty scenario list.
+  const scenario = scenarios[i % scenarios.length] ?? scenarios[0];
+  if (!scenario) throw new Error("no scenarios defined");
+  const { label, context } = scenario;
   const started = performance.now();
   try {
     const suggestion = await namer.suggest(context);
@@ -134,12 +142,17 @@ const problems = failed + invalid;
 console.log("");
 if (problems === 0) {
   console.log("RESULT: PASS (no failures, no invalid labels)");
-} else if (rateLimited && invalid === 0) {
+  process.exitCode = 0;
+} else if (invalid === 0 && rateLimited) {
+  // A distinct code rather than 0: returning success here would let a wrapper
+  // or CI step read "25% of calls failed" as a clean run. Callers that expect
+  // the free tier to cap them can treat 2 as "inconclusive, retry later".
   console.log(
     "RESULT: RATE LIMITED (0 invalid labels; back-to-back calls exceed the free tier)",
   );
   console.log("        Real worker traffic is throttled to 1 attempt/10min/tab.");
+  process.exitCode = 2;
 } else {
   console.log(`RESULT: FAIL (${problems} problem(s))`);
+  process.exitCode = 1;
 }
-process.exitCode = problems === 0 || (rateLimited && invalid === 0) ? 0 : 1;
