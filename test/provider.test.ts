@@ -19,7 +19,7 @@ import {
   loadProviderConfig,
   type CompletionRequest,
 } from "../src/provider.ts";
-import { type NamingContext } from "../src/domain.ts";
+import { type NamingContext, validateTabLabel } from "../src/domain.ts";
 
 const context: NamingContext = {
   project: "Agents",
@@ -167,6 +167,45 @@ test("namer sends one bounded completion and validates model output", async () =
     async () => '{"tab":"x","reason":"too short"}',
   );
   await assert.rejects(stillBroken.suggest(context), /invalid model tab label/);
+});
+
+test("namer trims a correct but over-long label instead of discarding it", async () => {
+  // Live failure on Groq/openai-gpt-oss-120b: the model follows the "lead
+  // with the project" rule and emits a hyphen-derived project name, producing
+  // 39 characters. Every word clears the shape check, so the label was
+  // rejected purely on length and the whole task was thrown away.
+  const tooLong = new AiSdkNamer(
+    { SMART_RENAME_API_KEY: "standalone-key" },
+    async () =>
+      '{"tab":"Telegram-Channel-Watcher Deploy Failure","reason":"over the char cap"}',
+  );
+  const trimmed = await tooLong.suggest(context);
+  assert.equal(trimmed.tab, "Telegram-Channel-Watcher Deploy");
+  assert.equal(trimmed.reason, "over the char cap");
+  assert.ok(validateTabLabel(trimmed.tab), "trimmed label must re-validate");
+
+  // Trimming keeps as much as possible: only enough trailing words go.
+  const barelyOver = new AiSdkNamer(
+    { SMART_RENAME_API_KEY: "standalone-key" },
+    async () => '{"tab":"Herdr Repair Tab Ownership Now","reason":"one char over"}',
+  );
+  const kept = await barelyOver.suggest(context);
+  assert.ok((kept.tab ?? "").length <= 34, "result must respect the cap");
+  assert.ok(validateTabLabel(kept.tab), "result must re-validate");
+
+  // The project leads the label, so it is the word that must survive; the
+  // task word is what gets sacrificed when the two cannot both fit.
+  assert.ok((trimmed.tab ?? "").startsWith("Telegram-Channel-Watcher"));
+
+  // A label that is over-long because its single leading word is huge is
+  // still rejected: truncating a project name would stop identifying the
+  // checkout, which is worse than not renaming.
+  const giantProject = new AiSdkNamer(
+    { SMART_RENAME_API_KEY: "standalone-key" },
+    async () =>
+      '{"tab":"AnExtremelyLongUnbrokenProjectIdentifier Fix","reason":"one huge word"}',
+  );
+  await assert.rejects(giantProject.suggest(context), /invalid model tab label/);
 });
 
 test("provider transport enforces the output-token ceiling without external network", async () => {

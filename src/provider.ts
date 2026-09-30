@@ -279,13 +279,54 @@ function parseSuggestion(text: string): NameSuggestion {
         /^[A-Z0-9]/.test(word) ? word : word[0]!.toUpperCase() + word.slice(1),
       )
       .join(" ");
-    const repaired = validateTabLabel(firstPass) ? firstPass : titleCase(output.tab);
-    if (!validateTabLabel(repaired)) {
+    // Stage 1 preserves the interior of every word, so a hyphen-derived
+    // project survives as one token. That matters for ordering: titleCase
+    // rewrites "-" to a space, which would split "Telegram-Channel-Watcher"
+    // into three words and burn two of the five word slots. Trim stage 1
+    // first so the project keeps its shape, and only fall back to titleCase
+    // for labels stage 1 cannot rescue at all.
+    //
+    // Length repair is the second deterministic failure mode. The model is
+    // told to lead with the project, so a hyphen-derived project routinely
+    // produces "Telegram-Channel-Watcher Deploy Failure" (39 chars). Every
+    // word clears the shape check, so the label failed purely on length and
+    // the whole task was discarded. Trimming is content preserving in the
+    // same way casing is: it never invents words, only removes whole words
+    // from the end, and the result must re-pass the same validation.
+    const cased = validateTabLabel(firstPass)
+      ? firstPass
+      : titleCase(output.tab);
+    const repaired =
+      (validateTabLabel(cased) ? cased : null) ??
+      trimToValidLabel(firstPass) ??
+      trimToValidLabel(cased);
+    if (!repaired || !validateTabLabel(repaired)) {
       throw new Error(`invalid model tab label: ${JSON.stringify(output.tab)}`);
     }
     return { tab: sanitizeText(repaired), reason: sanitizeText(output.reason) };
   }
   return { tab: sanitizeText(output.tab), reason: sanitizeText(output.reason) };
+}
+
+/**
+ * Deterministically shorten an over-long label by dropping trailing words,
+ * longest-candidate-first so as much of the original survives as possible.
+ * Returns null when no shortening can produce a valid label, so the caller
+ * still raises rather than inventing a name. Cutting a leading project name
+ * mid-word is deliberately not attempted: a truncated project name is worse
+ * than no rename, because it stops identifying which checkout the tab is in.
+ */
+function trimToValidLabel(label: string): string | null {
+  const words = label.split(/\s+/).filter(Boolean);
+  // Longest candidate first so only as many trailing words as necessary go.
+  for (let count = words.length - 1; count >= 2; count -= 1) {
+    const candidate = words.slice(0, count).join(" ");
+    if (validateTabLabel(candidate)) return candidate;
+  }
+  // Still too long with every trailing word dropped means the leading word
+  // alone exceeds the cap. Cutting a project name mid-word is worse than
+  // abstaining, so that case is left to the caller.
+  return null;
 }
 
 function safeProviderError(error: unknown, config: ProviderConfig): string {
