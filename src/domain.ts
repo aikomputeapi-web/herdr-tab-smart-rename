@@ -20,6 +20,12 @@ export interface SmartRenameState {
   contextChanges?: Record<string, number> | undefined;
   /** Value of contextChanges when the tab last earned a label. */
   namedAt?: Record<string, number> | undefined;
+  /**
+   * Per-tab AI failure streaks: consecutive model calls that threw. Powers the
+   * health summary so a persistent provider outage cannot stay silent (the
+   * 2026-09 "worker alive, every call failing" incident).
+   */
+  modelFailures?: Record<string, number> | undefined;
   [key: string]: unknown;
 }
 
@@ -573,4 +579,73 @@ export function markModelSuccess(
 ): void {
   state.fingerprints[tabId] = fingerprint(context);
   delete state.pendingFingerprints[tabId];
+  delete state.modelFailures?.[tabId];
+}
+
+export function markModelFailure(state: SmartRenameState, tabId: string): void {
+  const failures = (state.modelFailures ??= {});
+  failures[tabId] = (failures[tabId] ?? 0) + 1;
+}
+
+export interface ModelHealth {
+  /** Consecutive AI failures on the worst tab; 0 when everything is fine. */
+  worstStreak: number;
+  /** When the last recorded failure streak attempt was, epoch ms; null when none. */
+  lastFailureAt: number | null;
+  /** Tabs at or beyond the degraded threshold. */
+  degradedTabs: number;
+  /** Tabs that have at least one AI success fingerprint, ever. */
+  tabsWithSuccess: number;
+}
+
+/** A provider is degraded when the worst tab saw this many consecutive fails. */
+export const MODEL_DEGRADED_THRESHOLD = 5;
+
+/** Failures older than this are stale history, not an active outage. */
+export const MODEL_FAILURE_TTL_MS = 24 * 60 * 60 * 1000;
+
+export function modelHealthSummary(
+  state: SmartRenameState,
+  now = Date.now(),
+): ModelHealth {
+  const failures = state.modelFailures ?? {};
+  const attempts = state.modelAttempts ?? {};
+  let worstStreak = 0;
+  let lastFailureAt: number | null = null;
+  let degradedTabs = 0;
+  for (const [tabId, streak] of Object.entries(failures)) {
+    const attempted = attempts[tabId];
+    // A streak whose last attempt aged out is ancient history: either the tab
+    // is gone or the provider recovered elsewhere long ago. Do not alarm on
+    // it, but keep the state map from growing without bound.
+    if (attempted === undefined || now - attempted > MODEL_FAILURE_TTL_MS) {
+      delete failures[tabId];
+      continue;
+    }
+    worstStreak = Math.max(worstStreak, streak);
+    lastFailureAt = Math.max(lastFailureAt ?? 0, attempted);
+    if (streak >= MODEL_DEGRADED_THRESHOLD) degradedTabs += 1;
+  }
+  return {
+    worstStreak,
+    lastFailureAt,
+    degradedTabs,
+    tabsWithSuccess: Object.keys(state.fingerprints).length,
+  };
+}
+
+/**
+ * Human verdict for `status` and the watchdog. `degraded` means recent model
+ * calls keep throwing on every attempt — the silent-failure shape that kept
+ * the worker looking "healthy" in Sept 2026.
+ */
+export function modelHealthVerdict(
+  health: ModelHealth,
+): "healthy" | "degraded" | "quiet" {
+  if (health.degradedTabs > 0) return "degraded";
+  if (health.worstStreak >= MODEL_DEGRADED_THRESHOLD) return "degraded";
+  if (health.tabsWithSuccess === 0 && health.lastFailureAt === null) {
+    return "quiet";
+  }
+  return "healthy";
 }

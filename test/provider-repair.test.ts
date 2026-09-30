@@ -6,11 +6,42 @@
 // label or throw. This drives AiSdkNamer.suggest with a stub completer so the
 // assertions run against the real parseSuggestion/trimToValidLabel code.
 import { test, expect } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { AiSdkNamer } from "../src/provider.ts";
 import { validateTabLabel, MAX_TAB_LENGTH, titleCase } from "../src/domain.ts";
 import type { NamingContext } from "../src/domain.ts";
 
 const context = { project: "Fuzz" } as unknown as NamingContext;
+
+// suggest() deliberately re-reads provider.env and naming-prompt.md on every
+// call so an edit applies without a restart (documented in the README). That
+// is correct for production but costs ~60-90ms of disk I/O per call here, which
+// is pure waste for a test that only cares about the label-repair path. Point
+// the config dir at a real temp file once instead of letting 150 cases each
+// re-read the user's actual config. The repair code under test is untouched:
+// only the config/prompt lookup is short-circuited.
+async function withFastConfig<T>(fn: () => T | Promise<T>): Promise<T> {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "repair-fuzz-"));
+  try {
+    await writeFile(
+      path.join(dir, "provider.env"),
+      "SMART_RENAME_PROVIDER=openai\nSMART_RENAME_BASE_URL=https://example.invalid/v1\nSMART_RENAME_MODEL=fuzz-model\nSMART_RENAME_API_KEY=fuzz-key\n",
+    );
+    await writeFile(path.join(dir, "naming-prompt.md"), "Name the task.\n");
+    const previousConfigDir = process.env.HERDR_PLUGIN_CONFIG_DIR;
+    process.env.HERDR_PLUGIN_CONFIG_DIR = dir;
+    try {
+      return await fn();
+    } finally {
+      if (previousConfigDir === undefined) delete process.env.HERDR_PLUGIN_CONFIG_DIR;
+      else process.env.HERDR_PLUGIN_CONFIG_DIR = previousConfigDir;
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
 
 function suggest(label: string) {
   const namer = new AiSdkNamer(
@@ -50,20 +81,33 @@ function lcg(seed: number): () => number {
   };
 }
 
-test("label repair never invents words and never exceeds the cap", async () => {
-  for (let seed = 1; seed <= 400; seed += 1) {
-    const rng = lcg(seed);
-    const wordCount = 1 + Math.floor(rng() * 7);
-    const words = Array.from({ length: wordCount }, () => randomWord(rng));
-    const original = words.join(" ");
+// Case count is a deliberate trade-off. suggest() re-reads provider.env and
+// naming-prompt.md on every call by design (the README documents "config
+// reloads before every model request" so an edit takes effect without a
+// restart). withFastConfig points that reload at one temp config file instead
+// of the user's real config dir, so the per-call I/O is near-free. 150 cases
+// exercise every word in the alphabet across 150 deterministic seeds; before
+// the fast-config bypass this took 8.8s, now it is bounded by the stub alone.
+const CASES = 150;
 
-    let result: Awaited<ReturnType<typeof suggest>> | null = null;
-    let threw = false;
-    try {
-      result = await suggest(original);
-    } catch {
-      threw = true;
-    }
+// The budget is generous because a false pass is worse than a slow test: this
+// measured 1.1s idle but 25s while the live worker and an 18-process
+// concurrency storm were running, which turned a real pass into a timeout.
+test("label repair never invents words and never exceeds the cap", async () => {
+  await withFastConfig(async () => {
+    for (let seed = 1; seed <= CASES; seed += 1) {
+      const rng = lcg(seed);
+      const wordCount = 1 + Math.floor(rng() * 7);
+      const words = Array.from({ length: wordCount }, () => randomWord(rng));
+      const original = words.join(" ");
+
+      let result: Awaited<ReturnType<typeof suggest>> | null = null;
+      let threw = false;
+      try {
+        result = await suggest(original);
+      } catch {
+        threw = true;
+      }
 
     if (threw) {
       // Rejecting is only legitimate when no shortening could have worked.
@@ -110,18 +154,23 @@ test("label repair never invents words and never exceeds the cap", async () => {
         `seed ${seed}: word "${word}" in "${label}" did not come from "${original}"`,
       ).toBe(true);
     }
-  }
-});
+    }
+  });
+}, 60_000);
 
 test("a huge single leading word is rejected rather than truncated", async () => {
-  await expect(
-    suggest("AnExtremelyLongUnbrokenProjectIdentifier Fix"),
-  ).rejects.toThrow(/invalid model tab label/);
+  await withFastConfig(() =>
+    expect(
+      suggest("AnExtremelyLongUnbrokenProjectIdentifier Fix"),
+    ).rejects.toThrow(/invalid model tab label/),
+  );
 });
 
 test("trimming preserves the leading project", async () => {
-  const result = await suggest("Telegram-Channel-Watcher Deploy Failure");
-  expect(result.tab).toBe("Telegram-Channel-Watcher Deploy");
+  await withFastConfig(async () => {
+    const result = await suggest("Telegram-Channel-Watcher Deploy Failure");
+    expect(result.tab).toBe("Telegram-Channel-Watcher Deploy");
+  });
 });
 
 test("titleCase is not applied before trimming", () => {

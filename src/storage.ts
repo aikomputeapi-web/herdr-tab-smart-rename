@@ -35,6 +35,9 @@ const StateSchema: z.ZodType<SmartRenameState> = z.looseObject({
   // user's ownership records over a missing counter.
   contextChanges: z.record(z.string(), z.number()).optional(),
   namedAt: z.record(z.string(), z.number()).optional(),
+  // Added 2026-09-30: per-tab consecutive AI failure streaks for the health
+  // summary. Optional keeps older state files loadable.
+  modelFailures: z.record(z.string(), z.number()).optional(),
 });
 
 const UnknownRecordSchema = z.record(z.string(), z.unknown());

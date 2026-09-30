@@ -49,6 +49,7 @@ test("provider config preserves defaults and process-over-file precedence", asyn
       timeoutMs: 45_000,
       reasoningEffort: "medium",
       apiKey: "standalone-key",
+      noAuth: false,
     });
     await assert.rejects(
       loadProviderConfig({ ...fixture.env, KIMI_API_KEY: "wrong-provider-key" }),
@@ -81,6 +82,7 @@ test("provider config preserves defaults and process-over-file precedence", asyn
       timeoutMs: 30_000,
       promptPath: path.join(fixture.root, "prompts/custom.md"),
       apiKey: "process-key",
+      noAuth: false,
     });
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
@@ -101,6 +103,46 @@ test("private provider and prompt config enforce templates, permissions, and bou
     await assert.rejects(loadProviderConfig(fixture.env), /AI key missing.*provider\.env/i);
     await writeFile(file, "x".repeat(16 * 1024 + 1));
     await assert.rejects(loadProviderConfig(fixture.env), /exceeds 16 KiB/);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("SMART_RENAME_NO_AUTH flags keyless local proxies", async () => {
+  const fixture = await tempConfig();
+  try {
+    // The OpenCode Zen proxy style: origin-authenticated, rejects any
+    // *non-empty* Bearer value, unusable with a placeholder key unless the
+    // Authorization header is suppressed.
+    const config = await loadProviderConfig({
+      ...fixture.env,
+      SMART_RENAME_PROVIDER: "zen",
+      SMART_RENAME_BASE_URL: "https://zen.nowrouter.store/v1",
+      SMART_RENAME_MODEL: "mimo-v2.6-flash-free",
+      SMART_RENAME_API_KEY: "placeholder-not-sent",
+      SMART_RENAME_NO_AUTH: "1",
+    });
+    assert.equal(config.noAuth, true);
+
+    const offByDefault = await loadProviderConfig({
+      ...fixture.env,
+      SMART_RENAME_API_KEY: "real-key",
+    });
+    assert.equal(offByDefault.noAuth, false);
+
+    // Truthy spellings from a provider.env file parse the same way.
+    await writeFile(
+      fixture.file,
+      [
+        "SMART_RENAME_PROVIDER=zen",
+        "SMART_RENAME_BASE_URL=https://zen.nowrouter.store/v1",
+        "SMART_RENAME_MODEL=mimo-v2.6-flash-free",
+        "SMART_RENAME_API_KEY=placeholder",
+        "SMART_RENAME_NO_AUTH=true",
+      ].join("\n"),
+    );
+    const fromFile = await loadProviderConfig(fixture.env);
+    assert.equal(fromFile.noAuth, true);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

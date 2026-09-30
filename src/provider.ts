@@ -35,6 +35,8 @@ const ProviderConfigSchema = z.object({
   reasoningEffort: z.enum(["low", "medium", "high"]).optional(),
   promptPath: z.string().min(1).optional(),
   apiKey: z.string().min(1),
+  /** Sentinel for keyless local proxies: passes zod, suppresses Bearer. */
+  noAuth: z.boolean().optional(),
 });
 
 const ModelOutputSchema = z.object({
@@ -197,6 +199,13 @@ export async function loadProviderConfig(
       ? { promptPath: resolvePromptPath(configuredPrompt, env) }
       : {}),
     apiKey: providerApiKey(provider, env, fileEnv),
+    // A local proxy that authenticates by origin (the OpenCode Zen proxy on
+    // this machine) rejects *any* Bearer value while working fine with no
+    // Authorization header at all. The zod schema demands a non-empty key, so
+    // users flag the sentinel explicitly instead of leaving it empty.
+    noAuth: /^(1|true|yes)$/i.test(
+      env.SMART_RENAME_NO_AUTH || fileEnv.SMART_RENAME_NO_AUTH || "",
+    ),
   };
   const parsed = ProviderConfigSchema.safeParse(input);
   if (!parsed.success) throw configError(parsed.error);
@@ -347,10 +356,15 @@ export interface CompletionRequest {
 type Complete = (request: CompletionRequest) => Promise<string>;
 
 async function completeWithAiSdk(request: CompletionRequest): Promise<string> {
+  // A local proxy that authenticates by origin (the OpenCode Zen proxy on
+  // this machine) rejects *any* Bearer value while working fine with no
+  // Authorization header at all. The zod schema demands a non-empty key, so
+  // SMART_RENAME_NO_AUTH=1 flags the sentinel that suppresses the header.
   const provider = createOpenAICompatible({
     name: request.config.provider,
     baseURL: request.config.baseURL,
     apiKey: request.config.apiKey,
+    ...(request.config.noAuth ? { headers: { Authorization: "" } } : {}),
   });
   const result = await generateText({
     model: provider(request.config.model),

@@ -8,6 +8,7 @@ import {
   isGenericWorkspaceName,
   markModelAttempt,
   markNamed,
+  markModelFailure,
   markModelSuccess,
   observeStableContext,
   prepareRename,
@@ -375,6 +376,8 @@ export class AutoNameService {
                   : `${suggestion.reason}; used agent session title`;
               usedModel = true;
             } catch (error) {
+              markModelFailure(state, tab.tab_id);
+              if (!this.#dryRun) await persist();
               if (!fallbackTitle) throw error;
               // An exhausted free tier or a provider outage should not leave the
               // tab on "1" when the agent has already titled the session itself.

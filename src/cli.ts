@@ -2,12 +2,17 @@
 import { chmod, closeSync, openSync } from "node:fs";
 import { chmod as chmodAsync, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { type RenameResult } from "./domain.ts";
+import {
+  type RenameResult,
+  modelHealthSummary,
+  modelHealthVerdict,
+} from "./domain.ts";
 import { beginTabProgress, run, snapshot } from "./herdr.ts";
 import { loadNamingPrompt, loadProviderConfig } from "./provider.ts";
 import { createService } from "./service.ts";
 import {
   acquireLock,
+  loadState,
   ensurePrivateDir,
   statePaths,
   workerInfo,
@@ -136,11 +141,24 @@ async function stop(): Promise<void> {
 async function status(): Promise<void> {
   const paths = statePaths(requireStateDir());
   const info = await workerInfo(paths.pid, workerScript);
+  let verdict: ReturnType<typeof modelHealthVerdict> = "quiet";
   if (!info) {
     console.log("Smart Rename stopped");
+    process.exitCode = 1;
     return;
   }
+  // Process liveness alone is not health: the Sept 2026 incident kept the
+  // worker "running" for weeks while every AI call failed with an expired
+  // token. Read the failure streaks the worker persists and report them.
+  try {
+    const state = await loadState(paths.state);
+    verdict = modelHealthVerdict(modelHealthSummary(state));
+  } catch {
+    verdict = "quiet";
+  }
   console.log(`Smart Rename running (pid ${info.pid}, since ${info.startedAt})`);
+  console.log(`AI health: ${verdict}`);
+  if (verdict === "degraded") process.exitCode = 2;
 }
 
 async function renameAll(): Promise<RenameResult[]> {
